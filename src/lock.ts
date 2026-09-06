@@ -22,6 +22,7 @@ import { spawnSync } from "node:child_process";
 export const WRITER_LOCK_DIRECTORY = ".vito-writer.lock";
 const OWNER_FILENAME = "owner.json";
 const SIGNALS: NodeJS.Signals[] = ["SIGHUP", "SIGINT", "SIGTERM", "SIGQUIT"];
+const PS_EXECUTABLE = existsSync("/bin/ps") ? "/bin/ps" : existsSync("/usr/bin/ps") ? "/usr/bin/ps" : "ps";
 
 interface LockOwner {
   version: 1;
@@ -49,7 +50,7 @@ export class WriterLockIntegrityError extends Error {
 }
 
 function processStartIdentity(pid: number): string | null {
-  const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+  const result = spawnSync(PS_EXECUTABLE, ["-o", "lstart=", "-p", String(pid)], {
     encoding: "utf8",
     shell: false,
     stdio: ["ignore", "pipe", "ignore"],

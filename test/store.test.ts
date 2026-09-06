@@ -213,6 +213,20 @@ describe("WriterLock", () => {
     next.release();
   });
 
+  test("acquires under a scheduler PATH without system binaries", () => {
+    const stateDir = temporaryState();
+    const lockModule = new URL("../src/lock.ts", import.meta.url).href;
+    // The altered PATH must be isolated in a child process, so this test cannot use the parent's static import.
+    const script = `const { WriterLock } = await import(${JSON.stringify(lockModule)}); const lock = WriterLock.acquire(${JSON.stringify(stateDir)}); lock.release();`;
+    const result = Bun.spawnSync([process.execPath, "-e", script], {
+      env: { ...process.env, PATH: "/nonexistent" },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(result.exitCode, result.stderr.toString("utf8")).toBe(0);
+  });
+
   test("reclaims ownership proven stale by process-start identity", () => {
     const stateDir = temporaryState();
     chmodSync(stateDir, 0o700);
