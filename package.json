@@ -1,0 +1,25 @@
+{
+  "name": "vito-agent-activity",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "bun": ">=1.4.0"
+  },
+  "packageManager": "bun@1.4.0",
+  "scripts": {
+    "vito": "bun run src/cli.ts",
+    "build": "bun build web/widget.ts --outdir dist/web --target browser --minify --sourcemap=none && cp web/index.html web/widget.html web/styles.css dist/web/",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@js-temporal/polyfill": "^0.5.1",
+    "echarts": "^6.1.0",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.21",
+    "typescript": "^5.9.2"
+  }
+}
