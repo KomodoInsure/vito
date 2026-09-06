@@ -272,6 +272,29 @@ describe("Pages publisher", () => {
     })).toThrow("belongs to a different configured repository");
   }, 30_000);
 
+  test("upgrades a managed checkout from an older public snapshot schema", async () => {
+    const value = fixture();
+    await initialSetup(value);
+    const checkout = join(value.state, "pages");
+    writeFileSync(join(checkout, "docs", "activity.json"), `${JSON.stringify({ schemaVersion: 1 })}\n`);
+    runGit(["add", "--", "docs/activity.json"], checkout);
+    runGit([
+      "-c", "user.name=Fixture",
+      "-c", "user.email=fixture@example.test",
+      "commit", "-m", "legacy public snapshot",
+    ], checkout);
+    runGit(["push", "origin", "HEAD:refs/heads/main"], checkout);
+
+    const result = await publishActivity(value.config, {
+      at: LATER_CUTOFF,
+      transport: value.pages,
+      git: defaultGitTransport,
+    });
+
+    expect(result.pushed).toBe(true);
+    expect(publicSnapshotSchema.parse(JSON.parse(remoteFile(value, "docs/activity.json"))).schemaVersion).toBe(3);
+  }, 30_000);
+
   test("refuses dirty managed contents and remote divergence without changing success state", async () => {
     const dirty = fixture();
     await initialSetup(dirty);

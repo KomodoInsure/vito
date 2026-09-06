@@ -190,6 +190,7 @@ function privateStrings(config: Config): string[] {
     join(config.stateDir, "activity.sqlite"),
     ...config.workspaceRoots,
     ...config.repositories.map((repository) => repository.path),
+    ...(config.historicalWorkspaces ?? []).map((workspace) => workspace.path),
     ...Object.values(config.sources).flatMap((paths) => paths ?? []),
   ].filter((value, index, values) => value.length > 1 && values.indexOf(value) === index);
 }
@@ -242,8 +243,16 @@ function assertManagedCheckout(checkout: string, exportResult?: ExportResult, co
     }
     if (config !== undefined) assertPublicContent(readFileSync(published, "utf8"), config, `Pages asset ${file}`);
   }
-  const parsed = publicSnapshotSchema.safeParse(JSON.parse(readFileSync(join(docs, "activity.json"), "utf8")));
-  if (!parsed.success) fail(`Staged activity.json failed public schema validation: ${parsed.error.message}`);
+  let snapshot: unknown;
+  try {
+    snapshot = JSON.parse(readFileSync(join(docs, "activity.json"), "utf8"));
+  } catch {
+    fail("Pages activity.json is not valid JSON");
+  }
+  if (exportResult !== undefined) {
+    const parsed = publicSnapshotSchema.safeParse(snapshot);
+    if (!parsed.success) fail(`Staged activity.json failed public schema validation: ${parsed.error.message}`);
+  }
 }
 
 export const defaultGitTransport: GitTransport = {
