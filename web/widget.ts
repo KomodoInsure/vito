@@ -1304,6 +1304,11 @@ function renderFooter(snapshot: PublicSnapshot): HTMLElement {
   const updated = new Date(snapshot.cutoff);
   footer.append(element("span", undefined, `${snapshot.timezone} · Last update ${updated.toLocaleString(undefined, { timeZone: snapshot.timezone, dateStyle: "medium", timeStyle: "short" })}`));
   if (Date.now() - updated.valueOf() > 30 * 60_000) footer.append(element("span", "stale", "Stale data · over 30 minutes old"));
+  const project = element("a", "project-attribution", "Made with Vibe in the Open (VITO) · Build your own dashboard");
+  project.href = "https://github.com/KomodoInsure/vito";
+  project.target = "_blank";
+  project.rel = "noopener noreferrer";
+  footer.append(project);
   return footer;
 }
 
@@ -1360,9 +1365,21 @@ export function renderDashboard(root: HTMLElement, snapshot: PublicSnapshot, ini
   draw();
 }
 
+function configureEmbedExamples(): void {
+  for (const input of document.querySelectorAll<HTMLInputElement>("input[data-widget-view]")) {
+    const view = input.dataset.widgetView;
+    const title = input.dataset.embedTitle;
+    if (view === undefined || title === undefined) continue;
+    const url = new URL("./widget.html", window.location.href);
+    url.search = new URLSearchParams({ view, range: "30", theme: "auto" }).toString();
+    input.value = `<iframe src="${url.toString()}" title="${title}" loading="lazy"></iframe>`;
+  }
+}
+
 async function boot(): Promise<void> {
   const root = document.getElementById("app");
   if (!(root instanceof HTMLElement)) return;
+  configureEmbedExamples();
   const baseOptions = parseWidgetOptions(new URLSearchParams(window.location.search));
   applyTheme(baseOptions.theme);
   try {
