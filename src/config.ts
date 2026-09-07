@@ -107,7 +107,7 @@ const sourcesSchema = z
 export const configSchema: z.ZodType<Config> = z
   .object({
     version: z.literal(1),
-    companyName: z.string().trim().min(1).max(80).optional().default("Agent Native"),
+    companyName: z.string().trim().min(1).max(80).optional().default("Komodo Risk Inc"),
     workspaceRoots: z.array(absoluteNormalizedPathSchema).min(1),
     timezone: z.string().refine(isValidIanaTimezone, "Invalid IANA timezone"),
     stateDir: absoluteNormalizedPathSchema,
@@ -266,7 +266,7 @@ function canonicalizeConfig(config: Config): Config {
   validatePrivateLocations(stateDir, workspaceRoots, sources, repositories, historicalWorkspaces);
   return {
     version: 1,
-    companyName: config.companyName ?? "Agent Native",
+    companyName: config.companyName ?? "Komodo Risk Inc",
     workspaceRoots,
     timezone: config.timezone,
     stateDir,
@@ -335,7 +335,7 @@ export function initializeConfig(input: InitializeConfigInput): { configPath: st
 
   const config: Config = {
     version: 1,
-    companyName: input.companyName ?? "Agent Native",
+    companyName: input.companyName ?? "Komodo Risk Inc",
     workspaceRoots,
     timezone,
     stateDir,

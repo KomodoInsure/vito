@@ -16,7 +16,7 @@ function temporaryStore(): CollectorStore {
   return CollectorStore.open(stateDir);
 }
 
-function config(stateDir: string, timezone = "UTC", companyName = "Agent Native"): Config {
+function config(stateDir: string, timezone = "UTC", companyName = "Komodo Risk Inc"): Config {
   return {
     version: 1,
     companyName,
@@ -25,7 +25,7 @@ function config(stateDir: string, timezone = "UTC", companyName = "Agent Native"
     stateDir,
     sources: { codex: ["/synthetic/codex"], claude: [], omp: [], opencode: [], hermes: [] },
     repositories: [],
-    publication: { repository: "agent-native/activity", branch: "main" },
+    publication: { repository: "komodorisk/activity", branch: "main" },
   };
 }
 

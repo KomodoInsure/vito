@@ -45,7 +45,7 @@ describe("parseArgs accepted invocations", () => {
         "--state-dir",
         "state",
         "--pages-repo",
-        "agent-native/activity.widgets",
+        "komodorisk/activity.widgets",
         "--workspace",
         "/work/two",
       ],
@@ -53,7 +53,7 @@ describe("parseArgs accepted invocations", () => {
         {
           kind: "init",
           workspaceRoots: ["/work/one", "/work/two"],
-          pagesRepository: "agent-native/activity.widgets",
+          pagesRepository: "komodorisk/activity.widgets",
           timezone: "America/New_York",
           stateDir: resolve("state"),
         },

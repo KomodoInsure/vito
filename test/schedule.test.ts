@@ -251,6 +251,6 @@ describe("managed launchd plist", () => {
     const status = await scheduleStatus(value.config, value.configPath, value.options);
     expect(status).toMatchObject({ installed: true, managed: false, loaded: false });
     expect(value.launchctl.calls).toHaveLength(1);
-    expect(value.launchctl.calls[0]?.args).toEqual(["print", "gui/501/com.agentnative.vito"]);
+    expect(value.launchctl.calls[0]?.args).toEqual(["print", "gui/501/com.komodorisk.vito"]);
   });
 });

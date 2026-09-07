@@ -60,7 +60,7 @@ function publicSnapshot(at: string): PublicSnapshot {
   return {
     schemaVersion: 3,
     pricing: { ...PRICING_METADATA, sources: [...PRICING_METADATA.sources] },
-    organization: "Agent Native",
+    organization: "Komodo Risk Inc",
     timezone: "UTC",
     generatedAt: at,
     cutoff: at,

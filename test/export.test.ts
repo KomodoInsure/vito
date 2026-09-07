@@ -75,7 +75,7 @@ function snapshot(cutoffMs: number, usageRecords = 0): PublicSnapshot {
   return {
     schemaVersion: 3,
     pricing: { ...PRICING_METADATA, sources: [...PRICING_METADATA.sources] },
-    organization: "Agent Native",
+    organization: "Komodo Risk Inc",
     timezone: "UTC",
     generatedAt: instant,
     cutoff: instant,

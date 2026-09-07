@@ -53,7 +53,7 @@ describe("configuration initialization", () => {
       configPath: paths.configPath,
       companyName: "Komodo",
       workspaceRoots: [paths.workspace],
-      pagesRepository: "agent-native/activity",
+      pagesRepository: "komodorisk/activity",
       timezone: "America/New_York",
       stateDir: paths.stateDir,
     });
@@ -69,7 +69,7 @@ describe("configuration initialization", () => {
       initializeConfig({
         configPath: paths.configPath,
         workspaceRoots: [paths.workspace],
-        pagesRepository: "agent-native/activity",
+        pagesRepository: "komodorisk/activity",
         stateDir: paths.stateDir,
       }),
     ).toThrow(ConfigError);
@@ -82,7 +82,7 @@ describe("configuration initialization", () => {
       initializeConfig({
         configPath: paths.configPath,
         workspaceRoots: ["relative/workspace"],
-        pagesRepository: "agent-native/activity",
+        pagesRepository: "komodorisk/activity",
         stateDir: paths.stateDir,
       }),
     ).toThrow("workspace root must be absolute");
@@ -91,7 +91,7 @@ describe("configuration initialization", () => {
       initializeConfig({
         configPath: paths.configPath,
         workspaceRoots: [join(paths.root, "missing")],
-        pagesRepository: "agent-native/activity",
+        pagesRepository: "komodorisk/activity",
         stateDir: paths.stateDir,
       }),
     ).toThrow("does not exist");
@@ -100,7 +100,7 @@ describe("configuration initialization", () => {
       initializeConfig({
         configPath: "relative-config.json",
         workspaceRoots: [paths.workspace],
-        pagesRepository: "agent-native/activity",
+        pagesRepository: "komodorisk/activity",
         stateDir: paths.stateDir,
       }),
     ).toThrow("Configuration path must be absolute");
@@ -121,7 +121,7 @@ describe("configuration initialization", () => {
       initializeConfig({
         configPath: paths.configPath,
         workspaceRoots: [paths.workspace],
-        pagesRepository: "agent-native/activity",
+        pagesRepository: "komodorisk/activity",
         timezone: "Mars/Olympus_Mons",
         stateDir: paths.stateDir,
       }),
@@ -134,7 +134,7 @@ describe("configuration initialization", () => {
       initializeConfig({
         configPath: paths.configPath,
         workspaceRoots: [paths.workspace],
-        pagesRepository: "agent-native/activity",
+        pagesRepository: "komodorisk/activity",
         stateDir: join(paths.workspace, ".vito"),
       }),
     ).toThrow("overlaps protected");
@@ -142,7 +142,7 @@ describe("configuration initialization", () => {
     const initialized = initializeConfig({
       configPath: paths.configPath,
       workspaceRoots: [paths.workspace],
-      pagesRepository: "agent-native/activity",
+      pagesRepository: "komodorisk/activity",
       stateDir: paths.stateDir,
     });
     expect(() => validateOutputPath(initialized.config, join(paths.workspace, "public"))).toThrow("overlaps protected");
@@ -156,7 +156,7 @@ describe("configuration initialization", () => {
     const initialized = initializeConfig({
       configPath: paths.configPath,
       workspaceRoots: [paths.workspace],
-      pagesRepository: "agent-native/activity",
+      pagesRepository: "komodorisk/activity",
       stateDir: paths.stateDir,
     });
     const unsafe = { ...initialized.config, sources: { codex: [join(paths.stateDir, "source")] } };
@@ -170,7 +170,7 @@ describe("configuration initialization", () => {
     const initialized = initializeConfig({
       configPath: paths.configPath,
       workspaceRoots: [paths.workspace],
-      pagesRepository: "agent-native/activity",
+      pagesRepository: "komodorisk/activity",
       stateDir: paths.stateDir,
     });
     expect(configuredSourcePaths(initialized.config, "codex", ["/conventional/codex"])).toEqual([
@@ -192,7 +192,7 @@ describe("configuration initialization", () => {
       stateDir: paths.stateDir,
       sources: { codex: [], hidden: [] },
       repositories: [],
-      publication: { repository: "agent-native/activity", branch: "main" },
+      publication: { repository: "komodorisk/activity", branch: "main" },
     };
     expect(configSchema.safeParse(candidate).success).toBe(false);
   });
@@ -215,11 +215,11 @@ describe("configuration initialization", () => {
         repositoryPath: repository,
         match: "descendants" as const,
       }],
-      publication: { repository: "agent-native/activity", branch: "main" as const },
+      publication: { repository: "komodorisk/activity", branch: "main" as const },
     };
     writeFileSync(paths.configPath, `${JSON.stringify(candidate)}\n`, { mode: 0o600 });
     const loaded = loadConfig(paths.configPath);
-    expect(loaded.companyName).toBe("Agent Native");
+    expect(loaded.companyName).toBe("Komodo Risk Inc");
     expect(loaded.historicalWorkspaces).toEqual([{
       path: join(realpathSync(paths.root), "historical", "deleted"),
       repositoryPath: realpathSync(repository),
@@ -254,7 +254,7 @@ describe("public contract safety", () => {
   const snapshot = {
     schemaVersion: 3 as const,
     pricing: { ...PRICING_METADATA, sources: [...PRICING_METADATA.sources] },
-    organization: "Agent Native" as const,
+    organization: "Komodo Risk Inc" as const,
     timezone: "UTC",
     generatedAt: "2026-09-06T12:00:00.000Z",
     cutoff: "2026-09-06T12:00:00.000Z",

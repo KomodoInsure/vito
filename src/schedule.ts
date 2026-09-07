@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 
 import type { Config } from "./config";
 
-export const SCHEDULE_LABEL = "com.agentnative.vito";
+export const SCHEDULE_LABEL = "com.komodorisk.vito";
 const PLIST_FILENAME = `${SCHEDULE_LABEL}.plist`;
 const PUBLICATION_STATE_FILENAME = "publication-state.json";
 const DATABASE_FILENAME = "activity.sqlite";

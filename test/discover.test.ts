@@ -28,7 +28,7 @@ function fixtureConfig(root: string, sources: Config["sources"]): Config {
     stateDir: join(root, "state"),
     sources,
     repositories: [],
-    publication: { repository: "agent-native/activity", branch: "main" },
+    publication: { repository: "komodorisk/activity", branch: "main" },
   };
 }
 
@@ -77,13 +77,10 @@ afterEach(() => {
 describe("metadata-only source discovery", () => {
   test("enumerates accounting adapters and inventory-only tools in deterministic order", async () => {
     const home = temporaryHome();
-    const blumeDatabase = join(home, ".blume", "blume.sqlite");
     const kimiExecutable = join(home, ".kimi-code", "bin", "kimi");
     const grokPersistence = join(home, "Library", "Application Support", "Grok Bot", "sand-client-persistence");
-    mkdirSync(join(home, ".blume"), { recursive: true });
     mkdirSync(join(home, ".kimi-code", "bin"), { recursive: true });
     mkdirSync(grokPersistence, { recursive: true });
-    writeFileSync(blumeDatabase, "DO_NOT_PRINT_SECRET_SENTINEL");
     writeFileSync(kimiExecutable, "DO_NOT_PRINT_SECRET_SENTINEL");
     writeFileSync(join(grokPersistence, "z.blob"), "DO_NOT_PRINT_SECRET_SENTINEL");
     writeFileSync(join(grokPersistence, "a.blob"), "DO_NOT_PRINT_SECRET_SENTINEL");
@@ -96,7 +93,6 @@ describe("metadata-only source discovery", () => {
       "omp",
       "opencode",
       "hermes",
-      "blume",
       "kimi",
       "grok",
     ]);
@@ -106,7 +102,6 @@ describe("metadata-only source discovery", () => {
       "available",
       "available",
       "available",
-      "excluded-wrapper",
       "installed-no-history",
       "unsupported-schema",
     ]);
@@ -120,7 +115,6 @@ describe("metadata-only source discovery", () => {
     ]);
 
     const output = formatDiscoveryOutput(entries);
-    expect(output).toContain(blumeDatabase);
     expect(output).toContain('"unsupportedFiles": 2');
     expect(output).not.toContain("DO_NOT_PRINT_SECRET_SENTINEL");
     expect(await discoverSources(undefined, { homeDir: home, adapters: fixtureAdapters(home) })).toEqual(entries);
@@ -129,7 +123,6 @@ describe("metadata-only source discovery", () => {
   test("distinguishes an absent inventory source from an installed unsupported schema", () => {
     const absentHome = temporaryHome();
     expect(discoverInventorySources(absentHome).map(({ agent, state }) => [agent, state])).toEqual([
-      ["blume", "not-found"],
       ["kimi", "not-found"],
       ["grok", "not-found"],
     ]);

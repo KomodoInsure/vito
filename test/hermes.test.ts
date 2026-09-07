@@ -383,6 +383,7 @@ describe("Hermes cumulative accounting", () => {
       expect(unresolved?.reasons).toContain("unallocated-history");
       expect(batch.unallocatedUsageRecords).toBe(1);
       expect(JSON.stringify(batch)).not.toContain("https://billing.invalid/private-route");
+      expect(JSON.stringify(batch)).not.toContain("background-review");
     } finally {
       store.close();
     }

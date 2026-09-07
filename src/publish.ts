@@ -25,8 +25,8 @@ import { openCollectorStore } from "./store";
 export const PAGES_MARKER_FILE = ".vito-pages.json";
 export const PUBLICATION_STATE_FILE = "publication-state.json";
 export const PAGES_MARKER = Object.freeze({ schemaVersion: 1 as const, generator: "vito" as const });
-export const PUBLISH_COMMIT_MESSAGE = "Update Agent Native activity";
-export const PUBLISH_AUTHOR_NAME = "Agent Native Activity";
+export const PUBLISH_COMMIT_MESSAGE = "Update VITO activity";
+export const PUBLISH_AUTHOR_NAME = "VITO Activity";
 export const PUBLISH_AUTHOR_EMAIL = "activity@users.noreply.github.com";
 export const WIDGET_VIEWS = [
   "calendar",

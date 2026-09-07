@@ -251,7 +251,7 @@ function usageRecord(
     sessionKey: `hermes:${projected.sessionRawId}`,
     workspaceKey: workspace,
     repositoryKey: repository,
-    turnKey: projected.task.length > 0 ? `task:${projected.task}` : null,
+    turnKey: projected.task.length > 0 ? `task:${stableDigest([projected.task])}` : null,
     requestKey: null,
     atMs,
     provider: projected.provider,

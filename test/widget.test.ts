@@ -228,7 +228,7 @@ describe("public DOM safety boundary", () => {
     const fixture: PublicSnapshot = {
       schemaVersion: 3,
       pricing: { asOf: "2026-09-06", basis: "standard-api", sources: ["https://openai.com/api/pricing/"] },
-      organization: "Agent Native",
+      organization: "Komodo Risk Inc",
       timezone: "UTC",
       generatedAt: "2026-09-06T12:00:00.000Z",
       cutoff: "2026-09-06T12:00:00.000Z",

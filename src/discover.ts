@@ -23,9 +23,8 @@ const SOURCE_ORDER: Readonly<Record<string, number>> = {
   omp: 2,
   opencode: 3,
   hermes: 4,
-  blume: 5,
-  kimi: 6,
-  grok: 7,
+  kimi: 5,
+  grok: 6,
 };
 
 export interface DiscoveryOptions {
@@ -71,20 +70,10 @@ function missingInventoryEntry(agent: string): DiscoveryEntry {
  * expose the accounting and timing fields required by Vito.
  */
 export function discoverInventorySources(homeDir = homedir()): DiscoveryEntry[] {
-  const blumeDatabase = join(homeDir, ".blume", "blume.sqlite");
   const kimiExecutable = join(homeDir, ".kimi-code", "bin", "kimi");
   const grokRoot = join(homeDir, "Library", "Application Support", "Grok Bot");
   const grokPersistence = join(grokRoot, "sand-client-persistence");
 
-  const blume = pathExists(blumeDatabase)
-    ? unavailableInventoryEntry(
-        "blume",
-        "excluded-wrapper",
-        [blumeDatabase],
-        { excludedStores: 1, recognizedPaths: 1 },
-        ["upstream-owned"],
-      )
-    : missingInventoryEntry("blume");
 
   const kimi = pathExists(kimiExecutable)
     ? unavailableInventoryEntry(
@@ -105,7 +94,6 @@ export function discoverInventorySources(homeDir = homedir()): DiscoveryEntry[] 
         .sort((left, right) => left.localeCompare(right));
     } catch {
       return [
-        blume,
         kimi,
         unavailableInventoryEntry(
           "grok",
@@ -137,7 +125,7 @@ export function discoverInventorySources(homeDir = homedir()): DiscoveryEntry[] 
           )
         : missingInventoryEntry("grok");
 
-  return [blume, kimi, grok];
+  return [kimi, grok];
 }
 
 function normalizeEntry(entry: DiscoveryEntry): DiscoveryEntry {
