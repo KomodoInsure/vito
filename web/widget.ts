@@ -785,17 +785,6 @@ function renderModels(days: PublicDay[], state: RenderState, rerender: () => voi
   chartHost.setAttribute("role", "img");
   chartHost.setAttribute("aria-label", `Daily tokens grouped by ${state.grouping}; exact values available in the token data table.`);
   panel.body.append(chartHost);
-  const inspect = element("label", "control");
-  inspect.append(element("span", undefined, "Inspect day"));
-  const select = element("select");
-  select.setAttribute("aria-label", "Inspect daily token chart");
-  for (const [index, point] of series.values.entries()) {
-    const option = element("option", undefined, `${humanDate(point.date)} · ${metricText(point.fullTotal, (value) => `${formatCompactInteger.format(value)} tokens`)}`);
-    option.value = String(index);
-    select.append(option);
-  }
-  inspect.append(select);
-  panel.body.append(inspect);
   mountChart(state, chartHost, () => {
     const palette = getComputedStyle(document.documentElement);
     const color = (css: string) => palette.getPropertyValue(css.slice(4, -1)).trim();
@@ -834,11 +823,6 @@ function renderModels(days: PublicDay[], state: RenderState, rerender: () => voi
         } },
       }]),
     };
-  }, (chart) => {
-    const show = () => chart.dispatchAction({ type: "showTip", seriesIndex: 0, dataIndex: Number(select.value) });
-    select.addEventListener("change", show);
-    select.addEventListener("focus", show);
-    select.addEventListener("blur", () => chart.dispatchAction({ type: "hideTip" }));
   });
   const legend = element("div", "series-legend");
   for (const [seriesIndex, key] of series.keys.entries()) {
