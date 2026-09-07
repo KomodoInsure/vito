@@ -53,6 +53,9 @@ function fixture(): Fixture {
   writeFileSync(join(assets, "widget.html"), '<!doctype html><link rel="stylesheet" href="./styles.css"><script type="module" src="./widget.js"></script>\n');
   writeFileSync(join(assets, "widget.js"), 'fetch("./activity.json");\n');
   writeFileSync(join(assets, "styles.css"), ":root { color-scheme: light dark; }\n");
+  writeFileSync(join(assets, "LICENSE"), "Apache-2.0 fixture license\n");
+  writeFileSync(join(assets, "NOTICE"), "Synthetic project notice\n");
+  writeFileSync(join(assets, "THIRD_PARTY_NOTICES"), "Synthetic dependency notices\n");
   const config: Config = {
     version: 1,
     workspaceRoots: [workspace],

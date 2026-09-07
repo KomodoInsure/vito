@@ -11,6 +11,9 @@ const CONTENT_TYPES: Record<(typeof EXPORT_FILES)[number], string> = {
   "styles.css": "text/css; charset=utf-8",
   "widget.html": "text/html; charset=utf-8",
   "widget.js": "text/javascript; charset=utf-8",
+  "LICENSE": "text/plain; charset=utf-8",
+  "NOTICE": "text/plain; charset=utf-8",
+  "THIRD_PARTY_NOTICES": "text/plain; charset=utf-8",
 };
 
 const SECURITY_HEADERS: Record<string, string> = {

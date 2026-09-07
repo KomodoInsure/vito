@@ -137,7 +137,10 @@ Each export contains exactly:
 .nojekyll
 activity.json
 index.html
+LICENSE
+NOTICE
 styles.css
+THIRD_PARTY_NOTICES
 widget.html
 widget.js
 ```
@@ -462,3 +465,10 @@ The test suite uses synthetic JSONL, synthetic SQLite databases, temporary Git r
 - Locally known Git remote refs may be stale because Vito deliberately does not fetch.
 - Cost data is shown only when the source exposes usable dated evidence.
 - Live Pages setup and scheduling are explicit user operations, never automatic initialization side effects.
+
+## License
+
+VITO is licensed under the [Apache License 2.0](LICENSE). The project
+[NOTICE](NOTICE) and required attributions and license texts for bundled
+third-party software in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) are included
+in every generated static export.

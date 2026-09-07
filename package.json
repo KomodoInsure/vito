@@ -2,6 +2,11 @@
   "name": "vito-agent-activity",
   "version": "0.1.0",
   "private": true,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/KomodoInsure/vito.git"
+  },
   "type": "module",
   "engines": {
     "bun": ">=1.4.0"
@@ -9,7 +14,7 @@
   "packageManager": "bun@1.4.0",
   "scripts": {
     "vito": "bun run src/cli.ts",
-    "build": "bun build web/widget.ts --outdir dist/web --target browser --minify --sourcemap=none && cp web/index.html web/widget.html web/styles.css dist/web/",
+    "build": "bun build web/widget.ts --outdir dist/web --target browser --minify --sourcemap=none && cp web/index.html web/widget.html web/styles.css LICENSE NOTICE THIRD_PARTY_NOTICES dist/web/",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },

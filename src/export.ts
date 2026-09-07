@@ -23,11 +23,28 @@ import { publicSnapshotSchema } from "./contracts";
 import { buildPublicSnapshot } from "./metrics";
 import type { CollectorStore } from "./store";
 
-export const STATIC_ASSET_FILES = [".nojekyll", "index.html", "widget.html", "widget.js", "styles.css"] as const;
+export const STATIC_ASSET_FILES = [
+  ".nojekyll",
+  "index.html",
+  "widget.html",
+  "widget.js",
+  "styles.css",
+  "LICENSE",
+  "NOTICE",
+  "THIRD_PARTY_NOTICES",
+] as const;
 export const EXPORT_FILES = [...STATIC_ASSET_FILES, "activity.json"] as const;
 export const EXPORT_OWNERSHIP_FILE = "export-paths.json";
 
-const BUILT_ASSET_FILES = ["index.html", "widget.html", "widget.js", "styles.css"] as const;
+const BUILT_ASSET_FILES = [
+  "index.html",
+  "widget.html",
+  "widget.js",
+  "styles.css",
+  "LICENSE",
+  "NOTICE",
+  "THIRD_PARTY_NOTICES",
+] as const;
 const OWNERSHIP_SCHEMA_VERSION = 1;
 
 type SnapshotBuilder = (config: Config, store: CollectorStore, cutoffMs: number) => PublicSnapshot;
