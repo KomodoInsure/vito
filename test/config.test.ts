@@ -51,12 +51,14 @@ describe("configuration initialization", () => {
     const paths = fixturePaths();
     const initialized = initializeConfig({
       configPath: paths.configPath,
+      companyName: "Komodo",
       workspaceRoots: [paths.workspace],
       pagesRepository: "agent-native/activity",
       timezone: "America/New_York",
       stateDir: paths.stateDir,
     });
 
+    expect(initialized.config.companyName).toBe("Komodo");
     expect(initialized.config.workspaceRoots).toEqual([realpathSync(paths.workspace)]);
     expect(initialized.config.sources).toEqual({});
     expect(statSync(paths.configPath).mode & 0o777).toBe(0o600);
@@ -217,6 +219,7 @@ describe("configuration initialization", () => {
     };
     writeFileSync(paths.configPath, `${JSON.stringify(candidate)}\n`, { mode: 0o600 });
     const loaded = loadConfig(paths.configPath);
+    expect(loaded.companyName).toBe("Agent Native");
     expect(loaded.historicalWorkspaces).toEqual([{
       path: join(realpathSync(paths.root), "historical", "deleted"),
       repositoryPath: realpathSync(repository),

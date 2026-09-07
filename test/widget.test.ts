@@ -245,6 +245,8 @@ describe("public DOM safety boundary", () => {
       days: [day("2026-09-06", [], usage(0), unavailable)],
     };
     expect(isPublicSnapshot(fixture)).toBe(true);
+    expect(isPublicSnapshot({ ...fixture, organization: "Komodo" })).toBe(true);
+    expect(isPublicSnapshot({ ...fixture, organization: " " })).toBe(false);
     expect(isPublicSnapshot({ ...fixture, schemaVersion: 1 })).toBe(false);
     expect(isPublicSnapshot({ ...fixture, pricing: undefined })).toBe(false);
     expect(isPublicSnapshot({ ...fixture, pricing: { ...fixture.pricing, asOf: "2026-02-30" } })).toBe(false);

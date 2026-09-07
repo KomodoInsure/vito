@@ -827,7 +827,7 @@ export function buildPublicSnapshot(config: Config, store: CollectorStore, cutof
     const snapshot: PublicSnapshot = {
       schemaVersion: 3,
       pricing: { ...PRICING_METADATA, sources: [...PRICING_METADATA.sources] },
-      organization: "Agent Native",
+      organization: config.companyName ?? "Agent Native",
       timezone: config.timezone,
       generatedAt: new Date(cutoffMs).toISOString(),
       cutoff: new Date(cutoffMs).toISOString(),

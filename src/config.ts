@@ -31,6 +31,7 @@ export interface HistoricalWorkspaceConfig {
 
 export interface Config {
   version: 1;
+  companyName?: string;
   workspaceRoots: string[];
   timezone: string;
   stateDir: string;
@@ -41,6 +42,7 @@ export interface Config {
 }
 
 export interface InitializeConfigInput {
+  companyName?: string;
   configPath?: string;
   workspaceRoots: string[];
   pagesRepository: string;
@@ -105,6 +107,7 @@ const sourcesSchema = z
 export const configSchema: z.ZodType<Config> = z
   .object({
     version: z.literal(1),
+    companyName: z.string().trim().min(1).max(80).optional().default("Agent Native"),
     workspaceRoots: z.array(absoluteNormalizedPathSchema).min(1),
     timezone: z.string().refine(isValidIanaTimezone, "Invalid IANA timezone"),
     stateDir: absoluteNormalizedPathSchema,
@@ -263,6 +266,7 @@ function canonicalizeConfig(config: Config): Config {
   validatePrivateLocations(stateDir, workspaceRoots, sources, repositories, historicalWorkspaces);
   return {
     version: 1,
+    companyName: config.companyName ?? "Agent Native",
     workspaceRoots,
     timezone: config.timezone,
     stateDir,
@@ -331,6 +335,7 @@ export function initializeConfig(input: InitializeConfigInput): { configPath: st
 
   const config: Config = {
     version: 1,
+    companyName: input.companyName ?? "Agent Native",
     workspaceRoots,
     timezone,
     stateDir,

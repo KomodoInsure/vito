@@ -235,6 +235,7 @@ The private configuration has this shape:
 ```ts
 interface Config {
   version: 1;
+  companyName?: string;
   workspaceRoots: string[];
   timezone: string;
   stateDir: string;
@@ -259,6 +260,8 @@ interface Config {
 }
 ```
 
+`companyName` controls the dashboard eyebrow. It defaults to `"Agent Native"` for existing configurations.
+
 ### Source overrides
 
 For each accounting adapter:
@@ -274,6 +277,7 @@ Example:
 ```json
 {
   "version": 1,
+  "companyName": "Komodo",
   "workspaceRoots": ["/absolute/company/workspace"],
   "timezone": "America/New_York",
   "stateDir": "/absolute/private/vito-state",

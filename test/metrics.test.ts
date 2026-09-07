@@ -16,9 +16,10 @@ function temporaryStore(): CollectorStore {
   return CollectorStore.open(stateDir);
 }
 
-function config(stateDir: string, timezone = "UTC"): Config {
+function config(stateDir: string, timezone = "UTC", companyName = "Agent Native"): Config {
   return {
     version: 1,
+    companyName,
     workspaceRoots: ["/synthetic/workspace"],
     timezone,
     stateDir,
@@ -312,9 +313,10 @@ describe("public snapshot", () => {
           { repositoryKey: "private-repository-key", oid: "private-oid-two", committerMs: Date.parse("2026-09-05T11:00:00Z"), tipOid: "tip", collectedAtMs, shallow: false },
         ],
       });
-      const snapshot = buildPublicSnapshot(config(store.stateDir), store, collectedAtMs);
+      const snapshot = buildPublicSnapshot(config(store.stateDir, "UTC", "Komodo"), store, collectedAtMs);
       const activeDays = snapshot.days.filter((day) => day.commits.value !== null && day.commits.value > 0);
 
+      expect(snapshot.organization).toBe("Komodo");
       expect(activeDays).toHaveLength(1);
       expect(activeDays[0]?.commits).toEqual({ value: 2, status: "partial", reasons: ["stale-ref"] });
       expect(snapshot.days.at(-1)?.commits).toEqual({ value: 0, status: "partial", reasons: ["stale-ref"] });

@@ -143,7 +143,7 @@ export interface PublicSnapshot {
     basis: "standard-api";
     sources: string[];
   };
-  organization: "Agent Native";
+  organization: string;
   timezone: string;
   generatedAt: string;
   cutoff: string;
@@ -456,7 +456,7 @@ export const publicSnapshotSchema: z.ZodType<PublicSnapshot> = z
         }, { message: "Expected an HTTPS pricing source URL without credentials" })),
       })
       .strict(),
-    organization: z.literal("Agent Native"),
+    organization: z.string().trim().min(1).max(80),
     timezone: z.string().min(1).max(128),
     generatedAt: instantSchema,
     cutoff: instantSchema,

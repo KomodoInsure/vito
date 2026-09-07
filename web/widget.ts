@@ -257,7 +257,9 @@ function isDay(value: unknown): value is PublicDay {
 export function isPublicSnapshot(value: unknown): value is PublicSnapshot {
   if (!isObject(value) || !hasOnlyKeys(value, ["schemaVersion", "pricing", "organization", "timezone", "generatedAt", "cutoff", "periodStart", "periodEnd", "collectionStatus", "sources", "coverage", "days"])) return false;
   return (
-    value.schemaVersion === 3 && value.organization === "Agent Native" &&
+    value.schemaVersion === 3 &&
+    typeof value.organization === "string" && value.organization.length >= 1 && value.organization.length <= 80 &&
+    value.organization.trim() === value.organization &&
     isObject(value.pricing) && hasOnlyKeys(value.pricing, ["asOf", "basis", "sources"]) &&
     isPublicDate(value.pricing.asOf) && value.pricing.basis === "standard-api" &&
     Array.isArray(value.pricing.sources) && value.pricing.sources.every(isPricingSource) &&
@@ -919,6 +921,8 @@ function renderCards(days: PublicDay[], state: RenderState, view: WidgetView): H
   const averageConcurrency = stats === null || elapsedMs === 0 ? null : stats.agentMs / elapsedMs;
   const busyConcurrency = stats === null || stats.activeMs === 0 ? null : stats.agentMs / stats.activeMs;
   const agentHours = stats === null ? null : stats.agentMs / 3_600_000;
+  const parallelHours = stats === null ? null : stats.parallelMs / 3_600_000;
+  const parallelShare = stats === null || stats.activeMs === 0 ? null : stats.parallelMs / stats.activeMs;
   const streaks = inferenceStreaks(days, state.options.harness);
   const cards = element("section", "cards");
   cards.setAttribute("aria-label", "Activity summary");
@@ -929,6 +933,7 @@ function renderCards(days: PublicDay[], state: RenderState, view: WidgetView): H
   cards.dataset.uptime = uptime === null ? "unavailable" : String(uptime);
   cards.dataset.averageConcurrency = averageConcurrency === null ? "unavailable" : String(averageConcurrency);
   cards.dataset.busyConcurrency = busyConcurrency === null ? "unavailable" : String(busyConcurrency);
+  cards.dataset.parallelShare = parallelShare === null ? "unavailable" : String(parallelShare);
   cards.dataset.hourlyInferenceStreak = streaks.hourly === null ? "unavailable" : String(streaks.hourly);
   cards.dataset.dailyInferenceStreak = streaks.daily === null ? "unavailable" : String(streaks.daily);
   if (view === "all") cards.append(renderMetricCard(
@@ -963,6 +968,12 @@ function renderCards(days: PublicDay[], state: RenderState, view: WidgetView): H
     metricText(agentHours, (value) => formatDecimal.format(value)),
     "Time-weighted agent activity",
     "Active time summed across independent agent lanes. Two agents active for one hour contribute two agent-hours.",
+  ));
+  if (view === "all") cards.append(renderMetricCard(
+    "Parallel active time",
+    metricText(parallelShare, (value) => formatPercent.format(value)),
+    `Overlap hours: ${metricText(parallelHours, (value) => formatDecimal.format(value))}`,
+    "Share of recorded active wall-clock time with two or more agents active. Idle and unavailable time are excluded.",
   ));
   return cards;
 }
@@ -1375,6 +1386,8 @@ async function boot(): Promise<void> {
     if (!response.ok) throw new Error(`Activity data request failed (${response.status})`);
     const data: unknown = await response.json();
     if (!isPublicSnapshot(data)) throw new Error("Activity data does not match the public snapshot schema");
+    const eyebrow = document.querySelector<HTMLElement>(".eyebrow");
+    if (eyebrow !== null) eyebrow.textContent = data.organization;
     const options = parseWidgetOptions(new URLSearchParams(window.location.search), enabledHarnesses(data));
     renderDashboard(root, data, options);
   } catch (error) {
