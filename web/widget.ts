@@ -1196,7 +1196,7 @@ function renderCost(days: PublicDay[], state: RenderState, pricing: PublicSnapsh
     ];
     panel.body.append(element("p", "panel-note", `Unpriced usage is excluded, never treated as free${missing.length > 0 ? `: ${missing.join("; ")}` : "."}`));
   }
-  const methodology = element("details", "data-disclosure");
+  const methodology = element("details", "data-disclosure pricing-methodology");
   methodology.append(
     element("summary", undefined, "Pricing methodology and secondary cost evidence"),
     element("p", "panel-note", `Historical usage is valued at pinned standard API rates as of ${pricing.asOf}, not the rates billed on each usage date. Default standard processing and Anthropic five-minute cache writes are assumed. Reasoning tokens are counted within output once. No subscription fees, discounts, taxes, or other fees are included.`),

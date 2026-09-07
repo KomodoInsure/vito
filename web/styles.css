@@ -183,10 +183,12 @@ details[open].panel > summary::after { content: "−"; }
 
 .data-disclosure { font-size: .82rem; }
 .series-legend + .data-disclosure { margin-top: 1rem; }
+.pricing-methodology { margin-top: 1rem; }
 .data-disclosure summary { cursor: pointer; color: var(--accent); }
 .table-wrap { width: 100%; min-width: 0; max-width: 100%; overflow-x: auto; margin-top: .5rem; }
 table { width: 100%; border-collapse: collapse; font-size: .76rem; }
 th, td { padding: .42rem .55rem; text-align: right; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+tbody tr:last-child td { border-bottom: 0; }
 th:first-child, td:first-child { text-align: left; }
 th { color: var(--muted); }
 
