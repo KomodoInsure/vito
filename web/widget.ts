@@ -1304,7 +1304,15 @@ function renderFooter(snapshot: PublicSnapshot): HTMLElement {
   const updated = new Date(snapshot.cutoff);
   footer.append(element("span", undefined, `${snapshot.timezone} · Last update ${updated.toLocaleString(undefined, { timeZone: snapshot.timezone, dateStyle: "medium", timeStyle: "short" })}`));
   if (Date.now() - updated.valueOf() > 30 * 60_000) footer.append(element("span", "stale", "Stale data · over 30 minutes old"));
-  const project = element("a", "project-attribution", "Made with Vibe in the Open (VITO) · Build your own dashboard");
+  const project = element("a", "project-attribution");
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  icon.setAttribute("viewBox", "0 0 16 16");
+  icon.setAttribute("aria-hidden", "true");
+  icon.classList.add("github-icon");
+  const iconPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  iconPath.setAttribute("d", "M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.6-.18-3.29-.8-3.29-3.56 0-.79.28-1.43.74-1.93-.07-.18-.32-.91.07-1.9 0 0 .6-.19 1.98.74A6.9 6.9 0 0 1 8 4.58c.61 0 1.22.08 1.79.24 1.38-.93 1.98-.74 1.98-.74.39.99.14 1.72.07 1.9.46.5.74 1.14.74 1.93 0 2.77-1.69 3.38-3.3 3.56.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8Z");
+  icon.append(iconPath);
+  project.append(icon, document.createTextNode("Made with Vibe in the Open (VITO) · Build your own dashboard"));
   project.href = "https://github.com/KomodoInsure/vito";
   project.target = "_blank";
   project.rel = "noopener noreferrer";
