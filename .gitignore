@@ -19,3 +19,6 @@ coverage/
 .DS_Store
 .idea/
 .vscode/
+
+# Isolated development worktrees
+.worktrees/
