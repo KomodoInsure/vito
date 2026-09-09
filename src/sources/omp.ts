@@ -981,7 +981,7 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
     }
   }
   for (const input of normalized.inputs) {
-    if (input.kind !== "submission") continue;
+    if (input.kind === "context") continue;
     const retained = context.store.getInput(input.originKey);
     const retainedInput = retained === null ? null : storedInputRecord(retained);
     if (retainedInput?.kind === "replay") {
@@ -1002,6 +1002,11 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
   const inputQuality: Quality = fileCursors.length === 0
     ? "unavailable"
     : inputReasons.size > 0 ? "partial" : "recorded";
+  const coherentInputScan = discovery.paths.length > 0
+    && fileCursors.length === discovery.paths.length
+    && unsupported === 0
+    && scanFailures === 0
+    && inputReasons.size === 0;
   const inputSourceState = {
     sourceKey: OMP_SOURCE_KEY,
     agent: "omp" as const,
@@ -1009,7 +1014,7 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
     quality: inputQuality,
     reasons: [...inputReasons].sort(),
     scannedAtMs: context.cutoffMs,
-    lastSuccessfulScanMs: fileCursors.length > 0 ? context.cutoffMs : previousSuccessfulScan,
+    lastSuccessfulScanMs: coherentInputScan ? context.cutoffMs : previousSuccessfulScan,
   };
   const diagnosticCounts: Record<string, number> = { ...discovery.diagnosticCounts };
   if (unsupported > 0) {

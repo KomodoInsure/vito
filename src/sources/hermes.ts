@@ -73,9 +73,16 @@ interface ProjectedCounter {
   unresolvedRoute: boolean;
 }
 
+interface InputIdentityObservation {
+  originKey: string;
+  role: string;
+  atMs: number | null;
+}
+
 interface Projection {
   sessions: ProjectedSession[];
   inputs: InputRecord[];
+  inputIdentityObservations: InputIdentityObservation[];
   inputSupported: boolean;
   inputReasons: string[];
   schemaVersion: string;
@@ -537,7 +544,7 @@ function selectProjection(database: Database, databasePath: string): Projection 
       } else if (role === "user" && displayKind === null && compressedSummary === 0 && routablePlatformId) {
         kind = "submission";
       }
-      if (kind === "unknown") {
+      if (kind === "unknown" && role === "user") {
         inputReasons.add("input-kind-unknown");
         inputReasons.add("input-history-incomplete");
       }
@@ -597,6 +604,13 @@ function selectProjection(database: Database, databasePath: string): Projection 
     inputs.push(selected);
   }
   inputs.sort((left, right) => left.originKey.localeCompare(right.originKey));
+  const inputIdentityObservations = projectedInputs
+    .filter((candidate) => candidate.input.originKey.startsWith("hermes:input:"))
+    .map((candidate) => ({
+      originKey: candidate.input.originKey,
+      role: candidate.role,
+      atMs: candidate.input.atMs,
+    }));
 
   let schemaVersion = "unknown";
   if (tables.has("schema_version") && columnNames(database, "schema_version").has("version")) {
@@ -607,6 +621,7 @@ function selectProjection(database: Database, databasePath: string): Projection 
     sessions,
     inputs,
     inputSupported,
+    inputIdentityObservations,
     inputReasons: [...inputReasons].sort(),
     schemaVersion,
     parseGaps,
@@ -873,6 +888,14 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
     bucket.push(input);
     inputsByOrigin.set(input.originKey, bucket);
   }
+  const identityObservations = new Map<string, InputIdentityObservation[]>();
+  for (const observation of projections
+    .flatMap((projection) => projection.inputIdentityObservations)
+    .filter((record) => record.atMs === null || record.atMs <= context.cutoffMs)) {
+    const bucket = identityObservations.get(observation.originKey) ?? [];
+    bucket.push(observation);
+    identityObservations.set(observation.originKey, bucket);
+  }
   for (const bucket of inputsByOrigin.values()) {
     const ordered = [...bucket].sort((left, right) =>
       (left.atMs ?? Number.MAX_SAFE_INTEGER) - (right.atMs ?? Number.MAX_SAFE_INTEGER)
@@ -881,7 +904,17 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
     const selected = { ...ordered[0]!, reasons: [...ordered[0]!.reasons] };
     const timestamps = new Set(bucket.map((input) => input.atMs).filter((value): value is number => value !== null));
     const kinds = new Set(bucket.map((input) => input.kind));
-    if (timestamps.size > 1 || kinds.size > 1) {
+    const observations = identityObservations.get(selected.originKey) ?? [];
+    const observedRoles = new Set(observations.map((observation) => observation.role));
+    const observedTimestamps = new Set(observations
+      .map((observation) => observation.atMs)
+      .filter((value): value is number => value !== null));
+    if (
+      timestamps.size > 1
+      || kinds.size > 1
+      || observedTimestamps.size > 1
+      || [...observedRoles].some((role) => role !== "user")
+    ) {
       selected.kind = "unknown";
       selected.quality = "partial";
       selected.reasons = ["input-kind-unknown"];
@@ -914,6 +947,12 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
   const inputQuality: Quality = supportedInputDatabases === 0 || (certifiedInputs === 0 && ambiguousInputs > 0)
     ? "unavailable"
     : inputReasons.size > 0 ? "partial" : "recorded";
+  const coherentInputScan = paths.length > 0
+    && projections.length === paths.length
+    && supportedInputDatabases === paths.length
+    && unsupported === 0
+    && unreadable === 0
+    && inputReasons.size === 0;
   const inputSourceState = {
     sourceKey: SOURCE_KEY,
     agent: "hermes" as const,
@@ -923,7 +962,7 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
       ? ["missing-source"]
       : [...inputReasons].sort(),
     scannedAtMs: context.cutoffMs,
-    lastSuccessfulScanMs: supportedInputDatabases > 0 ? context.cutoffMs : previousSuccessfulScan,
+    lastSuccessfulScanMs: coherentInputScan ? context.cutoffMs : previousSuccessfulScan,
   };
 
   const copies = selectMigratedCopies(projections.flatMap((projection) => projection.sessions));

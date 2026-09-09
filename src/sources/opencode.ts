@@ -775,12 +775,13 @@ function sessionOrder(left: SourceSessionRow, right: SourceSessionRow): number {
   return (safeTimestamp(left.time_created) ?? Number.MAX_SAFE_INTEGER) - (safeTimestamp(right.time_created) ?? Number.MAX_SAFE_INTEGER)
     || left.id.localeCompare(right.id);
 }
+
 function storedPrefixInput(
   context: AdapterContext,
-  fingerprint: string,
+  position: number,
   sessionKey: string,
 ): InputRecord | null {
-  const prefix = `input-clone-prefix:${fingerprint}:`;
+  const prefix = `input-prefix-owner:${stableHash(sessionKey)}:${position}:`;
   const rows = context.store.database.query(`
     SELECT counter_key FROM counter_snapshots
     WHERE source_key = ? AND session_key = ? AND counter_key LIKE ?
@@ -861,10 +862,10 @@ function determineCloneOwners(scans: SessionScan[], context: AdapterContext): {
           || (currentStarted === storedStarted && sessionKey.localeCompare(storedOwner) < 0));
       if (currentIsOlder) {
         ownerBySession.set(storedOwner, sessionKey);
-        for (const message of scan.messages.slice(0, common)) {
+        for (const [position, message] of scan.messages.slice(0, common).entries()) {
           promotedPrefixFingerprints.add(message.fingerprint);
           if (message.input === null) continue;
-          const retainedInput = storedPrefixInput(context, message.fingerprint, storedOwner);
+          const retainedInput = storedPrefixInput(context, position, storedOwner);
           if (retainedInput === null || retainedInput.kind === "context" || retainedInput.kind === "unknown") continue;
           retainedReplayInputs.push({
             ...retainedInput,
@@ -1090,6 +1091,7 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
   const counterSnapshots: CounterSnapshot[] = [];
   let unsupported = 0;
   let parseGaps = 0;
+  let inputScanFailures = 0;
   let projectedDatabases = 0;
   for (const path of paths) {
     const probe = probeOpenCodeDatabase(path);
@@ -1105,6 +1107,7 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
       projectedDatabases += 1;
     } catch {
       parseGaps += 1;
+      inputScanFailures += 1;
     }
   }
 
@@ -1171,7 +1174,7 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
     }
   }
   currentInputs.push(...retainedReplayInputs);
-  if (unsupported > 0 || parseGaps > 0) inputReasons.add("input-history-incomplete");
+  if (unsupported > 0 || inputScanFailures > 0) inputReasons.add("input-history-incomplete");
   if (!forceInputHistory && priorInputState?.quality === "partial") {
     for (const reason of storedInputReasons(priorInputState)) inputReasons.add(reason);
   }
@@ -1182,6 +1185,11 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
   const inputQuality: Quality = projectedDatabases === 0
     ? "unavailable"
     : inputReasons.size > 0 ? "partial" : "recorded";
+  const coherentInputScan = paths.length > 0
+    && projectedDatabases === paths.length
+    && unsupported === 0
+    && inputScanFailures === 0
+    && inputReasons.size === 0;
   const inputSourceState = {
     sourceKey: SOURCE_KEY,
     agent: AGENT,
@@ -1189,7 +1197,7 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
     quality: inputQuality,
     reasons: [...inputReasons].sort(),
     scannedAtMs: context.cutoffMs,
-    lastSuccessfulScanMs: projectedDatabases > 0 ? context.cutoffMs : previousSuccessfulScan,
+    lastSuccessfulScanMs: coherentInputScan ? context.cutoffMs : previousSuccessfulScan,
   };
 
   const reasons = new Set<string>();
@@ -1214,7 +1222,7 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
   for (const scan of scans) {
     const sessionKey = `${scan.sourceHash}:${scan.session.id}`;
     const canonicalSessionKey = ownerBySession.get(sessionKey) ?? sessionKey;
-    for (const message of scan.messages.slice(0, PREFIX_LIMIT)) {
+    for (const [position, message] of scan.messages.slice(0, PREFIX_LIMIT).entries()) {
       const key = `clone-prefix:${message.fingerprint}`;
       if (promotedPrefixFingerprints.has(message.fingerprint)
         || (context.store.getCounterSnapshot(SOURCE_KEY, key) === null && !prefixSnapshots.has(key))) {
@@ -1230,7 +1238,7 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
       if (message.input !== null && !duplicateMessageKeys.has(`${sessionKey}:${message.row.id}`)) {
         counterSnapshots.push({
           sourceKey: SOURCE_KEY,
-          counterKey: `input-clone-prefix:${message.fingerprint}:${message.input.originKey}`,
+          counterKey: `input-prefix-owner:${stableHash(sessionKey)}:${position}:${message.input.originKey}`,
           sessionKey,
           observedAtMs: message.row.time_created,
           quality: "recorded",

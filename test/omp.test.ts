@@ -361,8 +361,9 @@ describe("OMP normalization", () => {
     temporaryDirectories.push(root);
     const project = join(root, "project");
     const path = join(project, "2026-09-06T12-05-00_fork.jsonl");
+    const missingPredecessor = join(project, "missing-original.jsonl");
     const records = [
-      header("fork", "2026-09-06T12:05:00.000Z"),
+      header("fork", "2026-09-06T12:05:00.000Z", { previousSessionFiles: [missingPredecessor] }),
       user("shared-entry", "2026-09-06T12:05:01.000Z"),
     ];
     mkdirSync(project, { recursive: true });
@@ -371,6 +372,7 @@ describe("OMP normalization", () => {
     const store = CollectorStore.open(stateDir);
     try {
       const retained = normalizeOmpSessions([{ path, records }]).inputs[0]!;
+      expect(retained.kind).toBe("unknown");
       store.writeBatch({ inputs: [{ ...retained, kind: "replay" }] });
       const config = { ...fixtureConfig([root]), stateDir };
       const batch = await ompAdapter.collect({

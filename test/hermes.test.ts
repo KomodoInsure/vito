@@ -578,6 +578,44 @@ describe("Hermes cumulative accounting", () => {
     }
   });
 
+  test("marks cross-database role conflicts unknown without emitting standalone non-user rows", async () => {
+    const root = temporaryRoot();
+    const userPath = join(root, "user.db");
+    const nonUserPath = join(root, "non-user.db");
+    const userDatabase = createHermesDatabase(userPath);
+    const nonUserDatabase = createHermesDatabase(nonUserPath);
+    insertSession(userDatabase, "user-session", 0);
+    insertSession(nonUserDatabase, "non-user-session", 0);
+    insertMessage(userDatabase, 1, "user-session", { platformId: "shared-platform-id" });
+    insertMessage(userDatabase, 2, "user-session", { platformId: "clean-platform-id" });
+    insertMessage(nonUserDatabase, 1, "non-user-session", {
+      role: "assistant",
+      platformId: "shared-platform-id",
+    });
+    insertMessage(nonUserDatabase, 2, "non-user-session", {
+      role: "assistant",
+      platformId: "assistant-only",
+    });
+    userDatabase.close();
+    nonUserDatabase.close();
+    const store = fixtureStore(root);
+    try {
+      const batch = await collect(store, [userPath, nonUserPath]);
+      expect(batch.inputs).toHaveLength(2);
+      expect(batch.inputs.find((input) => input.nativeInputId === "shared-platform-id")).toMatchObject({
+        kind: "unknown",
+        quality: "partial",
+      });
+      expect(batch.inputs.some((input) => input.nativeInputId === "assistant-only")).toBe(false);
+      expect(batch.inputSourceState).toMatchObject({
+        quality: "partial",
+        lastSuccessfulScanMs: null,
+      });
+    } finally {
+      store.close();
+    }
+  });
+
   test("reports input counts unavailable when only identity-ambiguous rows exist", async () => {
     const root = temporaryRoot();
     const path = join(root, "state.db");

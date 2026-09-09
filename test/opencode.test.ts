@@ -243,6 +243,10 @@ describe("OpenCode SQLite adapter", () => {
       const first = await opencodeAdapter.collect(context(config, store));
       expect(first.usage).toHaveLength(1);
       expect(first.usage[0]?.total).toBeNull();
+      expect(first.inputSourceState).toMatchObject({
+        quality: "recorded",
+        lastSuccessfulScanMs: 100_000,
+      });
       commitBatch(store, first);
 
       writer.query("UPDATE message SET time_updated=?, data=? WHERE id=?")
@@ -316,6 +320,14 @@ describe("OpenCode SQLite adapter", () => {
       const config = configuration(sourcePath, stateDir);
       const first = await opencodeAdapter.collect(context(config, store));
       commitBatch(store, first);
+      const inputOwnershipKeys = (store.database.query(`
+        SELECT counter_key FROM counter_snapshots WHERE counter_key LIKE 'input-%'
+      `).all() as Array<{ counter_key: string }>).map((row) => row.counter_key);
+      expect(inputOwnershipKeys).toHaveLength(1);
+      expect(inputOwnershipKeys[0]).toMatch(
+        /^input-prefix-owner:[0-9a-f]{64}:0:opencode:input:[0-9a-f]{64}$/,
+      );
+      expect(inputOwnershipKeys.some((key) => key.startsWith("input-clone-prefix:"))).toBe(false);
       expect(first.inputs.find((input) => input.nativeInputId === "user-copy")?.kind).toBe("submission");
 
       insertSession(writer, "session-original", 1_000);

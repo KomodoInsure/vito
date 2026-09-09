@@ -304,13 +304,25 @@ describe("Codex input normalization", () => {
       { id: "submission-b", kind: "submission", controller: "fixture-controller", origin: "unknown", lane: "main" },
       { id: "unknown", kind: "unknown", controller: "fixture-controller", origin: "unknown", lane: "main" },
     ]);
-    expect(result.inputReasons).toEqual(["input-kind-unknown"]);
+    expect(result.inputReasons).toEqual(["input-history-incomplete", "input-kind-unknown"]);
     const unsupported = normalizeCodexJsonl(jsonl([
       header(),
       record("event_msg", { type: "user_message", message: "not a stable input" }, 5, 5),
     ]));
     expect(unsupported.inputs).toEqual([]);
     expect(unsupported.inputReasons).toEqual(["input-history-incomplete"]);
+    const mixed = normalizeCodexJsonl(jsonl([
+      header(),
+      userInput("verified", ["user.text"], 1),
+      record("event_msg", { type: "user_message", turn_id: "unmatched-turn" }, 2, 2),
+    ]));
+    expect(mixed.inputReasons).toEqual(["input-history-incomplete"]);
+    const mirrored = normalizeCodexJsonl(jsonl([
+      header(),
+      userInput("verified", ["user.text"], 1),
+      record("event_msg", { type: "user_message", turn_id: "shared-accounting-turn" }, 2, 2),
+    ]));
+    expect(mirrored.inputReasons).toEqual([]);
   });
 
   test("emits a unique session origin for each native session while preserving accounting identities", () => {
@@ -507,6 +519,68 @@ describe("Codex adapter collection", () => {
       });
       expect(replaced.usage).toHaveLength(1);
       expect(replaced.usage[0]?.total).toBe(5);
+    } finally {
+      store.close();
+      rmSync(temporary, { recursive: true, force: true });
+    }
+  });
+
+  test("retries a partial first input backfill and advances success only after recovery", async () => {
+    const temporary = mkdtempSync(join(tmpdir(), "vito-codex-input-state-"));
+    const sourceRoot = join(temporary, "codex");
+    const stateDir = join(temporary, "state");
+    const rolloutPath = join(sourceRoot, "rollout-input-state.jsonl");
+    mkdirSync(sourceRoot);
+    writeFileSync(rolloutPath, jsonl([
+      header({ id: "input-state-session" }),
+      userInput("input-state-id", null, 1),
+    ]));
+    const config: Config = {
+      version: 1,
+      workspaceRoots: ["/synthetic/workspace"],
+      timezone: "UTC",
+      stateDir,
+      sources: { codex: [sourceRoot] },
+      repositories: [],
+      publication: { repository: "synthetic/activity", branch: "main" },
+    };
+    const store = CollectorStore.open(stateDir);
+    try {
+      const first = await codexAdapter.collect({
+        config,
+        store,
+        rebuild: false,
+        cutoffMs: BASE + 10_000,
+        reconcileAll: false,
+      });
+      expect(first.inputSourceState).toMatchObject({
+        quality: "partial",
+        lastSuccessfulScanMs: null,
+      });
+      store.writeBatch({
+        inputs: first.inputs,
+        inputSourceStates: [first.inputSourceState],
+        fileCursors: first.fileCursors,
+      });
+
+      writeFileSync(rolloutPath, jsonl([
+        header({ id: "input-state-session" }),
+        userInput("input-state-id", ["user.text"], 1),
+      ]));
+      const second = await codexAdapter.collect({
+        config,
+        store,
+        rebuild: false,
+        cutoffMs: BASE + 20_000,
+        reconcileAll: false,
+      });
+      expect(second.inputSourceState).toMatchObject({
+        quality: "recorded",
+        lastSuccessfulScanMs: BASE + 20_000,
+      });
+      expect(second.inputs).toEqual([
+        expect.objectContaining({ nativeInputId: "input-state-id", kind: "submission" }),
+      ]);
     } finally {
       store.close();
       rmSync(temporary, { recursive: true, force: true });

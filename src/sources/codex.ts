@@ -263,8 +263,9 @@ class CodexNormalizer {
   readonly reasons = new Set<string>();
   unallocatedUsageRecords = 0;
   private readonly inputReasons = new Set<string>();
-  private sawVerifiedInput = false;
-  private sawUnsupportedInputProjection = false;
+  private readonly verifiedInputTurns = new Set<string>();
+  private readonly unsupportedInputTurns = new Set<string>();
+  private sawUnkeyedUnsupportedInputProjection = false;
 
   private readonly state: ContextState;
 
@@ -331,7 +332,7 @@ class CodexNormalizer {
       return;
     }
     if (type === "event_msg" && payload.type === "user_message") {
-      this.sawUnsupportedInputProjection = true;
+      this.noteUnsupportedInputProjection(record, payload);
       return;
     }
     if (type === "turn_context") {
@@ -350,7 +351,9 @@ class CodexNormalizer {
     }
     if (type === "event_msg" && payload.type === "item_completed") {
       const item = object(payload.item);
-      if (normalizedItemType(item?.type) === "usermessage") this.sawUnsupportedInputProjection = true;
+      if (normalizedItemType(item?.type) === "usermessage") {
+        this.noteUnsupportedInputProjection(record, payload, item);
+      }
       this.acceptTimedItem(record, payload);
     }
   }
@@ -401,7 +404,10 @@ class CodexNormalizer {
         reasons: [...this.reasons].filter((reason) => reason === "counter-discontinuity" || reason === "unallocated-history"),
       });
     }
-    if (this.sawUnsupportedInputProjection && !this.sawVerifiedInput) {
+    if (
+      this.sawUnkeyedUnsupportedInputProjection
+      || [...this.unsupportedInputTurns].some((turn) => !this.verifiedInputTurns.has(turn))
+    ) {
       this.inputReasons.add("input-history-incomplete");
     }
     const mergedInputs = mergeInputRecords(this.inputs);
@@ -459,12 +465,13 @@ class CodexNormalizer {
     if (!this.state.sessionKey) return;
     const nativeInputId = stringValue(payload.id);
     if (nativeInputId === null) {
-      this.sawUnsupportedInputProjection = true;
+      this.sawUnkeyedUnsupportedInputProjection = true;
       this.inputReasons.add("input-history-incomplete");
       return;
     }
-    this.sawVerifiedInput = true;
     const metadata = object(payload.internal_chat_message_metadata_passthrough);
+    const inputTurn = stringValue(metadata?.turn_id);
+    if (inputTurn !== null) this.verifiedInputTurns.add(inputTurn);
     const rawKinds = metadata?.content_item_kinds;
     const kinds = Array.isArray(rawKinds)
       ? rawKinds.filter((kind): kind is string => typeof kind === "string")
@@ -500,6 +507,18 @@ class CodexNormalizer {
       quality: kind === "unknown" ? "partial" : "recorded",
       reasons,
     });
+  }
+
+  private noteUnsupportedInputProjection(
+    record: UnknownRecord,
+    payload: UnknownRecord,
+    item: UnknownRecord | null = null,
+  ): void {
+    const turn = stringValue(item?.turn_id)
+      ?? stringValue(payload.turn_id)
+      ?? stringValue(record.turn_id);
+    if (turn === null) this.sawUnkeyedUnsupportedInputProjection = true;
+    else this.unsupportedInputTurns.add(turn);
   }
 
   private acceptModern(record: UnknownRecord, payload: UnknownRecord, atMs: number | null): void {
@@ -1121,6 +1140,9 @@ export const codexAdapter: SourceAdapter = {
     const inputQuality: Quality = successfulInputScans === 0
       ? "unavailable"
       : inputReasons.size > 0 ? "partial" : "recorded";
+    const coherentInputScan = inventory.jsonl.length > 0
+      && successfulInputScans === inventory.jsonl.length
+      && inputReasons.size === 0;
     const inputSourceState = {
       sourceKey: "codex",
       agent: AGENT,
@@ -1128,7 +1150,7 @@ export const codexAdapter: SourceAdapter = {
       quality: inputQuality,
       reasons: [...inputReasons].sort(),
       scannedAtMs: context.cutoffMs,
-      lastSuccessfulScanMs: successfulInputScans > 0 ? context.cutoffMs : previousSuccessfulScan,
+      lastSuccessfulScanMs: coherentInputScan ? context.cutoffMs : previousSuccessfulScan,
     };
 
     const state = discovery.state === "available" && reasons.size > 0 ? "partial" : discovery.state;

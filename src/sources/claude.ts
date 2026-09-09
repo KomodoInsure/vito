@@ -767,6 +767,9 @@ export const claudeAdapter: SourceAdapter = {
     const inputQuality: Quality = successfulInputScans === 0
       ? "unavailable"
       : inputReasons.size > 0 ? "partial" : "recorded";
+    const coherentInputScan = found.files.length > 0
+      && successfulInputScans === found.files.length
+      && inputReasons.size === 0;
     const previousSuccessfulScan = typeof priorInputState?.last_successful_scan_ms === "number"
       ? priorInputState.last_successful_scan_ms
       : null;
@@ -777,7 +780,7 @@ export const claudeAdapter: SourceAdapter = {
       quality: inputQuality,
       reasons: [...inputReasons].sort(),
       scannedAtMs: context.cutoffMs,
-      lastSuccessfulScanMs: successfulInputScans > 0 ? context.cutoffMs : previousSuccessfulScan,
+      lastSuccessfulScanMs: coherentInputScan ? context.cutoffMs : previousSuccessfulScan,
     };
 
 
