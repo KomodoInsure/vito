@@ -45,6 +45,7 @@ export const WIDGET_VIEWS = [
 
 const MANAGED_ROOT_FILES = [PAGES_MARKER_FILE, "docs"] as const;
 const STAGED_PATHS = [PAGES_MARKER_FILE, ...EXPORT_FILES.map((file) => `docs/${file}`)] as const;
+const PRE_NOTICE_EXPORT_FILES = EXPORT_FILES.filter((file) => file !== "NOTICE");
 const MARKER_TEXT = `${JSON.stringify(PAGES_MARKER, null, 2)}\n`;
 const GITHUB_TOKEN_PATTERN = /(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,})/;
 
@@ -162,6 +163,17 @@ function exactEntries(directory: string, expectedEntries: readonly string[], lab
   }
 }
 
+function replaceableEntries(directory: string, label: string): readonly string[] {
+  assertRealDirectory(directory, label);
+  const actual = readdirSync(directory).sort();
+  const legacy = [...PRE_NOTICE_EXPORT_FILES].sort();
+  if (actual.length === legacy.length && actual.every((entry, index) => entry === legacy[index])) {
+    return PRE_NOTICE_EXPORT_FILES;
+  }
+  exactEntries(directory, EXPORT_FILES, label);
+  return EXPORT_FILES;
+}
+
 function parseMarker(content: string): void {
   let value: unknown;
   try {
@@ -229,8 +241,11 @@ function assertManagedCheckout(checkout: string, exportResult?: ExportResult, co
   exactEntries(checkout, [".git", ...MANAGED_ROOT_FILES], "Pages checkout");
   assertMarker(join(checkout, PAGES_MARKER_FILE));
   const docs = join(checkout, "docs");
-  exactEntries(docs, EXPORT_FILES, "Pages docs directory");
-  for (const file of EXPORT_FILES) {
+  const docsFiles = exportResult === undefined
+    ? replaceableEntries(docs, "Pages docs directory")
+    : EXPORT_FILES;
+  if (exportResult !== undefined) exactEntries(docs, docsFiles, "Pages docs directory");
+  for (const file of docsFiles) {
     const published = join(docs, file);
     assertRegularFile(published, `Pages asset ${file}`);
     if (exportResult !== undefined) {
@@ -489,7 +504,7 @@ async function prepareCheckout(
 function installGeneratedAssets(checkout: string, exportResult: ExportResult, config: Config): void {
   assertExport(exportResult, config);
   const docs = join(checkout, "docs");
-  if (exists(docs)) exactEntries(docs, EXPORT_FILES, "Pages docs directory");
+  if (exists(docs)) replaceableEntries(docs, "Pages docs directory");
   else mkdirSync(docs, { mode: 0o755 });
   for (const file of EXPORT_FILES) {
     copyFileSync(join(exportResult.outDir, file), join(docs, file));

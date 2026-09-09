@@ -190,6 +190,28 @@ describe("static export", () => {
     for (const file of EXPORT_FILES) expect(readFileSync(join(value.output, file), "utf8")).not.toContain("PRIVATE_SENTINEL");
   });
 
+  test("migrates an exact owned export from the pre-NOTICE manifest", () => {
+    const value = fixture();
+    const cutoffMs = Date.parse("2026-09-06T12:00:00.000Z");
+    exportStaticSite(value.config, value.store, {
+      outDir: value.output,
+      at: cutoffMs,
+      assetsDir: value.assets,
+      buildSnapshot: () => snapshot(cutoffMs),
+    });
+    rmSync(join(value.output, "NOTICE"));
+
+    exportStaticSite(value.config, value.store, {
+      outDir: value.output,
+      at: cutoffMs,
+      assetsDir: value.assets,
+      buildSnapshot: () => snapshot(cutoffMs),
+    });
+
+    expect(readdirSync(value.output).sort()).toEqual([...EXPORT_FILES].sort());
+    expect(readFileSync(join(value.output, "NOTICE"), "utf8")).toBe("Synthetic project notice\n");
+  });
+
   test("rejects non-owned directories, source overlaps, symlink assets, and invalid snapshots", () => {
     const value = fixture();
     const cutoffMs = Date.parse("2026-09-06T12:00:00.000Z");

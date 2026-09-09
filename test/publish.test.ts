@@ -295,6 +295,31 @@ describe("Pages publisher", () => {
     expect(publicSnapshotSchema.parse(JSON.parse(remoteFile(value, "docs/activity.json"))).schemaVersion).toBe(3);
   }, 30_000);
 
+  test("upgrades a managed checkout from the pre-NOTICE file set", async () => {
+    const value = fixture();
+    await initialSetup(value);
+    const checkout = join(value.state, "pages");
+    runGit(["rm", "--", "docs/NOTICE"], checkout);
+    runGit([
+      "-c", "user.name=Fixture",
+      "-c", "user.email=fixture@example.test",
+      "commit", "-m", "legacy Pages file set",
+    ], checkout);
+    runGit(["push", "origin", "HEAD:refs/heads/main"], checkout);
+
+    const result = await publishActivity(value.config, {
+      at: LATER_CUTOFF,
+      transport: value.pages,
+      git: defaultGitTransport,
+    });
+
+    expect(result.pushed).toBe(true);
+    expect(remotePaths(value).sort()).toEqual([
+      PAGES_MARKER_FILE,
+      ...EXPORT_FILES.map((file) => `docs/${file}`),
+    ].sort());
+  }, 30_000);
+
   test("refuses dirty managed contents and remote divergence without changing success state", async () => {
     const dirty = fixture();
     await initialSetup(dirty);

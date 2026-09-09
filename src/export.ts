@@ -223,6 +223,17 @@ function assertExactManifest(directory: string): void {
   for (const file of EXPORT_FILES) assertRegularFile(join(directory, file), `Export asset ${file}`);
 }
 
+function assertReplaceableManifest(directory: string): void {
+  assertDirectory(directory, "Export directory");
+  const actual = readdirSync(directory).sort();
+  const legacy = EXPORT_FILES.filter((file) => file !== "NOTICE").sort();
+  if (actual.length === legacy.length && actual.every((entry, index) => entry === legacy[index])) {
+    for (const file of legacy) assertRegularFile(join(directory, file), `Export asset ${file}`);
+    return;
+  }
+  assertExactManifest(directory);
+}
+
 function validateSnapshot(snapshot: unknown, expectedInstant: string): PublicSnapshot {
   const result = publicSnapshotSchema.safeParse(snapshot);
   if (!result.success) fail(`Public snapshot validation failed: ${result.error.message}`);
@@ -286,7 +297,7 @@ function stageExport(
 }
 
 function replaceOwnedExport(stagingDirectory: string, outputDirectory: string): void {
-  assertExactManifest(outputDirectory);
+  assertReplaceableManifest(outputDirectory);
   for (const file of STATIC_ASSET_FILES) renameSync(join(stagingDirectory, file), join(outputDirectory, file));
   renameSync(join(stagingDirectory, "activity.json"), join(outputDirectory, "activity.json"));
   assertExactManifest(outputDirectory);
@@ -306,7 +317,7 @@ export function exportStaticSite(config: Config, store: CollectorStore, options:
   if (existing) {
     assertDirectory(outputDirectory, "Owned export directory");
     if (realpathSync(outputDirectory) !== outputDirectory) fail("Owned export directory no longer resolves to its recorded path");
-    assertExactManifest(outputDirectory);
+    assertReplaceableManifest(outputDirectory);
   }
 
   const snapshot = validateSnapshot((options.buildSnapshot ?? buildPublicSnapshot)(config, store, cutoffMs), expectedInstant);
