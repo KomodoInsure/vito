@@ -459,7 +459,9 @@ describe("public DOM safety boundary", () => {
     const unsafe = structuredClone(fixture) as PublicSnapshot & { days: Array<PublicDay & { repository: string }> };
     unsafe.days[0]!.repository = "/private/repository";
     expect(isPublicSnapshot(unsafe)).toBe(false);
-    const missingRange = structuredClone(fixture) as PublicSnapshot & { inputRanges: Record<string, unknown> };
+    const missingRange: Omit<PublicSnapshot, "inputRanges"> & {
+      inputRanges: Partial<PublicSnapshot["inputRanges"]>;
+    } = structuredClone(fixture);
     delete missingRange.inputRanges["90"];
     expect(isPublicSnapshot(missingRange)).toBe(false);
     const inconsistent = structuredClone(fixture);

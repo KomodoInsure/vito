@@ -5,6 +5,8 @@ import { AriaComponent, GridComponent, TooltipComponent } from "echarts/componen
 import { SVGRenderer } from "echarts/renderers";
 import type {
   Agent,
+  HumanCadenceStats,
+  InputStats,
   Metric,
   PublicCost,
   PublicDay,
@@ -131,7 +133,7 @@ function isInstant(value: unknown): value is string {
     Number.isFinite(Date.parse(value));
 }
 
-function isMetric(value: unknown, valueCheck: (candidate: unknown) => boolean): boolean {
+function isMetric<T>(value: unknown, valueCheck: (candidate: unknown) => candidate is T): value is Metric<T> {
   return (
     isObject(value) &&
     hasOnlyKeys(value, ["value", "status", "reasons"]) &&
@@ -139,6 +141,12 @@ function isMetric(value: unknown, valueCheck: (candidate: unknown) => boolean): 
     isQuality(value.status) &&
     isPublicReasons(value.reasons)
   );
+}
+function isCacheReadBasis(value: unknown): value is { readTokens: number; promptTokens: number } {
+  return isObject(value) &&
+    hasOnlyKeys(value, ["readTokens", "promptTokens"]) &&
+    isCount(value.readTokens) &&
+    isCount(value.promptTokens);
 }
 
 function isCount(value: unknown): value is number {
@@ -149,9 +157,7 @@ function isUsage(value: unknown): value is PublicUsage {
   if (!isObject(value) || !hasOnlyKeys(value, ["total", "uncachedInput", "cacheRead", "cacheWrite", "output", "reasoning", "otherRecorded", "cacheReadBasis"])) return false;
   const counterKeys = ["total", "uncachedInput", "cacheRead", "cacheWrite", "output", "reasoning", "otherRecorded"] as const;
   if (!counterKeys.every((key) => isMetric(value[key], isCount))) return false;
-  return isMetric(value.cacheReadBasis, (basis) =>
-    isObject(basis) && hasOnlyKeys(basis, ["readTokens", "promptTokens"]) && isCount(basis.readTokens) && isCount(basis.promptTokens),
-  );
+  return isMetric(value.cacheReadBasis, isCacheReadBasis);
 }
 
 function isUsd(value: unknown): value is number {
@@ -234,21 +240,25 @@ function safeCountSum(values: readonly number[]): number | null {
   return total;
 }
 
-function isInputStats(value: unknown): boolean {
-  if (!isObject(value) || !hasOnlyKeys(value, INPUT_COUNTER_KEYS) || !INPUT_COUNTER_KEYS.every((key) => isCount(value[key]))) return false;
-  const total = safeCountSum([value.human as number, value.automated as number, value.unknown as number]);
+function isInputStats(value: unknown): value is InputStats {
+  if (!isObject(value) || !hasOnlyKeys(value, INPUT_COUNTER_KEYS)) return false;
+  const { human, automated, unknown, activeSessions } = value;
+  if (!isCount(human) || !isCount(automated) || !isCount(unknown) || !isCount(activeSessions)) return false;
+  const total = safeCountSum([human, automated, unknown]);
   return total !== null &&
-    total >= (value.activeSessions as number) &&
-    ((total === 0) === ((value.activeSessions as number) === 0));
+    total >= activeSessions &&
+    ((total === 0) === (activeSessions === 0));
 }
 
-function isCadenceStats(value: unknown): boolean {
-  return isObject(value) &&
-    hasOnlyKeys(value, CADENCE_COUNTER_KEYS) &&
-    CADENCE_COUNTER_KEYS.every((key) => isCount(value[key])) &&
-    (value.sessions as number) > 0 &&
-    (value.humanInputs as number) >= (value.sessions as number) &&
-    (value.recordedWorkMs as number) > 0;
+function isCadenceStats(value: unknown): value is HumanCadenceStats {
+  if (!isObject(value) || !hasOnlyKeys(value, CADENCE_COUNTER_KEYS)) return false;
+  const { sessions, humanInputs, recordedWorkMs } = value;
+  return isCount(sessions) &&
+    isCount(humanInputs) &&
+    isCount(recordedWorkMs) &&
+    sessions > 0 &&
+    humanInputs >= sessions &&
+    recordedWorkMs > 0;
 }
 
 function isCounterObject(value: unknown, keys: readonly string[]): value is Record<string, number> {
@@ -256,32 +266,31 @@ function isCounterObject(value: unknown, keys: readonly string[]): value is Reco
 }
 
 function isInputGroup(value: unknown): value is PublicInputGroup {
+  if (!isObject(value) || !hasOnlyKeys(value, ["inputs", "cadence", "cadenceCoverage", "excluded"])) return false;
+  const { inputs, cadence, cadenceCoverage, excluded } = value;
   if (
-    !isObject(value) ||
-    !hasOnlyKeys(value, ["inputs", "cadence", "cadenceCoverage", "excluded"]) ||
-    !isMetric(value.inputs, isInputStats) ||
-    !isMetric(value.cadence, isCadenceStats) ||
-    !isObject(value.cadenceCoverage) ||
-    !hasOnlyKeys(value.cadenceCoverage, ["consideredSessions", "excluded"]) ||
-    !isCount(value.cadenceCoverage.consideredSessions) ||
-    !isCounterObject(value.cadenceCoverage.excluded, CADENCE_EXCLUDED_KEYS) ||
-    !isCounterObject(value.excluded, INPUT_EXCLUDED_KEYS)
+    !isMetric(inputs, isInputStats) ||
+    !isMetric(cadence, isCadenceStats) ||
+    !isObject(cadenceCoverage) ||
+    !hasOnlyKeys(cadenceCoverage, ["consideredSessions", "excluded"]) ||
+    !isCount(cadenceCoverage.consideredSessions)
   ) return false;
-  if ((value.inputs.value === null) !== (value.inputs.status === "unavailable")) return false;
-  if ((value.cadence.value === null) !== (value.cadence.status === "unavailable")) return false;
-  const inputs = value.inputs.value as Record<string, number> | null;
-  const cadence = value.cadence.value as Record<string, number> | null;
-  const considered = value.cadenceCoverage.consideredSessions;
-  if (considered !== (inputs?.activeSessions ?? 0)) return false;
-  const excluded = value.cadenceCoverage.excluded;
+  const cadenceExcluded = cadenceCoverage.excluded;
+  if (!isCounterObject(cadenceExcluded, CADENCE_EXCLUDED_KEYS) || !isCounterObject(excluded, INPUT_EXCLUDED_KEYS)) return false;
+  if ((inputs.value === null) !== (inputs.status === "unavailable")) return false;
+  if ((cadence.value === null) !== (cadence.status === "unavailable")) return false;
+  const inputStats = inputs.value;
+  const cadenceStats = cadence.value;
+  const considered = cadenceCoverage.consideredSessions;
+  if (considered !== (inputStats?.activeSessions ?? 0)) return false;
   const classified = safeCountSum([
-    cadence?.sessions ?? 0,
-    ...CADENCE_EXCLUDED_KEYS.map((key) => excluded[key]!),
+    cadenceStats?.sessions ?? 0,
+    ...CADENCE_EXCLUDED_KEYS.map((key) => cadenceExcluded[key]!),
   ]);
   if (classified === null || classified !== considered) return false;
-  return cadence === null || inputs !== null &&
-    cadence.humanInputs! <= inputs.human! &&
-    cadence.sessions! <= inputs.activeSessions!;
+  return cadenceStats === null || inputStats !== null &&
+    cadenceStats.humanInputs <= inputStats.human &&
+    cadenceStats.sessions <= inputStats.activeSessions;
 }
 
 function inputRangeCountersMatch(range: PublicInputRange): boolean {
@@ -309,21 +318,23 @@ function inputRangeCountersMatch(range: PublicInputRange): boolean {
   return true;
 }
 
+function isAgent(value: unknown): value is Agent {
+  return typeof value === "string" && AGENT_VALUES.some((agent) => agent === value);
+}
+
 function isInputRange(value: unknown): value is PublicInputRange {
-  if (
-    !isObject(value) ||
-    !hasOnlyKeys(value, ["all", "byHarness"]) ||
-    !isInputGroup(value.all) ||
-    !Array.isArray(value.byHarness)
-  ) return false;
+  if (!isObject(value) || !hasOnlyKeys(value, ["all", "byHarness"]) || !isInputGroup(value.all) || !Array.isArray(value.byHarness)) return false;
+  const all = value.all;
+  const byHarness: PublicInputRange["byHarness"] = [];
   let previous = -1;
   for (const entry of value.byHarness) {
-    if (!isObject(entry) || !hasOnlyKeys(entry, ["harness", "group"]) || !AGENT_VALUES.includes(entry.harness as Agent) || !isInputGroup(entry.group)) return false;
-    const position = AGENT_VALUES.indexOf(entry.harness as Agent);
+    if (!isObject(entry) || !hasOnlyKeys(entry, ["harness", "group"]) || !isAgent(entry.harness) || !isInputGroup(entry.group)) return false;
+    const position = AGENT_VALUES.indexOf(entry.harness);
     if (position <= previous) return false;
     previous = position;
+    byHarness.push({ harness: entry.harness, group: entry.group });
   }
-  return inputRangeCountersMatch(value as PublicInputRange);
+  return inputRangeCountersMatch({ all, byHarness });
 }
 
 function isInputRanges(value: unknown): value is PublicSnapshot["inputRanges"] {

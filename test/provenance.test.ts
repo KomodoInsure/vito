@@ -81,7 +81,15 @@ function event(
   inputId: string,
   origin: "human" | "automated",
   controller?: string,
-): Record<string, unknown> {
+): {
+  version: 1;
+  agent: "codex";
+  sessionId: string;
+  inputId: string;
+  status: "delivered";
+  origin: "human" | "automated";
+  controller?: string;
+} {
   return {
     version: 1,
     agent: "codex",
