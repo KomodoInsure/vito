@@ -1084,13 +1084,25 @@ function renderCards(days: PublicDay[], state: RenderState, view: WidgetView): H
   return cards;
 }
 
+function unavailableInputGroup(): PublicInputGroup {
+  return {
+    inputs: { value: null, status: "unavailable", reasons: ["input-history-incomplete"] },
+    cadence: { value: null, status: "unavailable", reasons: [] },
+    cadenceCoverage: {
+      consideredSessions: 0,
+      excluded: { inputHistory: 0, mixedScope: 0, unknownOrigin: 0, noHumanInput: 0, noRecordedWork: 0 },
+    },
+    excluded: { context: 0, replayed: 0, unknownKind: 0, subagent: 0, unknownLane: 0, undated: 0 },
+  };
+}
+
 export function renderInputs(snapshot: PublicSnapshot, state: RenderState): HTMLElement {
   const rangeKey = String(state.options.range) as keyof PublicSnapshot["inputRanges"];
   const range: PublicInputRange = snapshot.inputRanges[rangeKey];
-  const group = state.options.harness === "all"
-    ? range.all
-    : range.byHarness.find((entry) => entry.harness === state.options.harness)?.group;
-  if (group === undefined) throw new TypeError("Selected harness is missing input-range data");
+  const selectedEntry = state.options.harness === "all"
+    ? undefined
+    : range.byHarness.find((entry) => entry.harness === state.options.harness);
+  const group = state.options.harness === "all" ? range.all : selectedEntry?.group ?? unavailableInputGroup();
 
   const cadence = group.cadence.value;
   const inputs = group.inputs.value;
@@ -1234,7 +1246,12 @@ export function renderInputs(snapshot: PublicSnapshot, state: RenderState): HTML
   for (const label of ["Harness", "Input status", "Timing status"]) sourcesHeader.append(element("th", undefined, label));
   sourcesHead.append(sourcesHeader);
   const sourcesBody = element("tbody");
-  for (const entry of range.byHarness) {
+  const disclosureEntries = [...range.byHarness];
+  if (state.options.harness !== "all" && selectedEntry === undefined) {
+    disclosureEntries.push({ harness: state.options.harness, group });
+    disclosureEntries.sort((left, right) => AGENT_VALUES.indexOf(left.harness) - AGENT_VALUES.indexOf(right.harness));
+  }
+  for (const entry of disclosureEntries) {
     const timing = snapshot.sources.find((source) => source.agent === entry.harness)?.work ?? "unavailable";
     const row = element("tr");
     row.append(

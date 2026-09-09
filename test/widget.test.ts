@@ -411,6 +411,35 @@ describe("human input cadence panel", () => {
     expect(claudeOnly).toContain("—");
     expect(claudeOnly).toContain("1 human · 0 automated · 0 unknown");
   });
+
+  test("renders unavailable data when a globally valid harness has no group in the selected range", () => {
+    const ranges = inputRanges();
+    const retainedClaude = inputGroup(
+      { human: 1, automated: 0, unknown: 0, activeSessions: 1 },
+      null,
+      "partial",
+    );
+    ranges["30"] = {
+      all: structuredClone(retainedClaude),
+      byHarness: [
+        { harness: "codex", group: inputGroup() },
+        { harness: "claude", group: retainedClaude },
+      ],
+    };
+    const snapshot = snapshotFixture(ranges);
+    snapshot.sources = [
+      { agent: "omp", state: "available", tokens: "recorded", work: "recorded", reasons: [] },
+    ];
+
+    const retainedOnlyInLongerRange = renderInputText(snapshot, 7, "claude");
+    expect(retainedOnlyInLongerRange).toContain("Cadence unavailable");
+    expect(retainedOnlyInLongerRange).toContain("— human · — automated · — unknown");
+    expect(retainedOnlyInLongerRange).toContain("claudeUnavailableUnavailable");
+
+    const accountingOnly = renderInputText(snapshot, 7, "omp");
+    expect(accountingOnly).toContain("Cadence unavailable");
+    expect(accountingOnly).toContain("ompUnavailableRecorded");
+  });
 });
 describe("public DOM safety boundary", () => {
   test("strictly rejects unknown nested keys", () => {
