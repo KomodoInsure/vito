@@ -175,7 +175,9 @@ function reconcileRetainedClaims(
           submissions.size === 0 ? "input-provenance-pending" : "input-provenance-ambiguous",
           1,
         );
+        const retainedClaimsConflict = new Set(tupleClaims.map((claim) => claim.origin)).size > 1;
         for (const row of tupleInputs) {
+          if (row.origin_evidence === "conflict" && retainedClaimsConflict) continue;
           if (
             row.origin_evidence !== "provenance"
             && !(row.origin_evidence === "conflict" && row.native_origin_evidence !== null)

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import type { Config } from "../src/config";
+import { buildPublicSnapshot } from "../src/metrics";
 import { CollectorStore } from "../src/store";
 import {
   codexAdapter,
@@ -598,6 +599,88 @@ describe("Codex adapter collection", () => {
       expect(second.inputs).toEqual([
         expect.objectContaining({ nativeInputId: "input-state-id", kind: "submission" }),
       ]);
+    } finally {
+      store.close();
+      rmSync(temporary, { recursive: true, force: true });
+    }
+  });
+
+  test("retains a first-backfill partition gap after that partition disappears", async () => {
+    const temporary = mkdtempSync(join(tmpdir(), "vito-codex-disappearing-gap-"));
+    const sourceRoot = join(temporary, "codex");
+    const stateDir = join(temporary, "state");
+    const cleanPath = join(sourceRoot, "rollout-clean.jsonl");
+    const malformedPath = join(sourceRoot, "rollout-malformed.jsonl");
+    mkdirSync(sourceRoot);
+    writeFileSync(cleanPath, jsonl([
+      header({ id: "clean-session" }),
+      userInput("clean-input", ["user.text"], 1),
+    ]));
+    writeFileSync(
+      malformedPath,
+      `${JSON.stringify(header({ id: "malformed-session" }))}\n{"malformed":\n`,
+    );
+    const config: Config = {
+      version: 1,
+      workspaceRoots: ["/synthetic/workspace"],
+      timezone: "UTC",
+      stateDir,
+      sources: { codex: [sourceRoot] },
+      repositories: [],
+      publication: { repository: "synthetic/activity", branch: "main" },
+    };
+    const store = CollectorStore.open(stateDir);
+    try {
+      const first = await codexAdapter.collect({
+        config,
+        store,
+        rebuild: false,
+        cutoffMs: BASE + 10_000,
+        reconcileAll: false,
+      });
+      expect(first.inputSourceState).toMatchObject({
+        quality: "partial",
+        reasons: ["input-history-incomplete"],
+        lastSuccessfulScanMs: null,
+      });
+      store.writeBatch({
+        inputs: first.inputs.map((input) => ({
+          ...input,
+          origin: "human" as const,
+          originEvidence: "source" as const,
+        })),
+        inputSourceStates: [first.inputSourceState],
+        fileCursors: first.fileCursors,
+      });
+
+      rmSync(malformedPath);
+      const second = await codexAdapter.collect({
+        config,
+        store,
+        rebuild: false,
+        cutoffMs: BASE + 20_000,
+        reconcileAll: false,
+      });
+      expect(second.inputSourceState).toMatchObject({
+        quality: "partial",
+        reasons: ["input-history-incomplete"],
+        lastSuccessfulScanMs: null,
+      });
+      store.writeBatch({
+        inputs: second.inputs,
+        inputSourceStates: [second.inputSourceState],
+        fileCursors: second.fileCursors,
+      });
+
+      const group = buildPublicSnapshot(config, store, BASE + 20_000).inputRanges["7"].all;
+      expect(group.inputs.value).toEqual({
+        human: 1,
+        automated: 0,
+        unknown: 0,
+        activeSessions: 1,
+      });
+      expect(group.cadence.value).toBeNull();
+      expect(group.cadenceCoverage.excluded.inputHistory).toBe(1);
     } finally {
       store.close();
       rmSync(temporary, { recursive: true, force: true });

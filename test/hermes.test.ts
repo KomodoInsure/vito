@@ -98,7 +98,7 @@ function createHermesDatabase(path: string, legacy = false): Database {
       role TEXT NOT NULL,
       timestamp REAL,
       platform_message_id TEXT,
-      observed INTEGER NOT NULL DEFAULT 0,
+      observed INTEGER DEFAULT 0,
       active INTEGER NOT NULL DEFAULT 1,
       compacted INTEGER NOT NULL DEFAULT 0,
       display_kind TEXT,
@@ -189,7 +189,7 @@ function insertMessage(
     role?: string;
     timestamp?: number;
     platformId?: string | null;
-    observed?: number;
+    observed?: number | string | null;
     active?: number;
     compacted?: number;
     displayKind?: string | null;
@@ -207,7 +207,7 @@ function insertMessage(
     options.role ?? "user",
     options.timestamp ?? DAY_ONE,
     options.platformId ?? null,
-    options.observed ?? 0,
+    options.observed === undefined ? 0 : options.observed,
     options.active ?? 1,
     options.compacted ?? 0,
     options.displayKind ?? null,
@@ -572,6 +572,37 @@ describe("Hermes cumulative accounting", () => {
       expect(batch.inputSourceState).toMatchObject({
         parserVersion: 1,
         quality: "partial",
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  test("certifies submissions only when observed is exactly integer zero", async () => {
+    const root = temporaryRoot();
+    const path = join(root, "state.db");
+    const source = createHermesDatabase(path);
+    insertSession(source, "observed-boundaries", 0);
+    insertMessage(source, 1, "observed-boundaries", { platformId: "zero", observed: 0 });
+    insertMessage(source, 2, "observed-boundaries", { platformId: "positive", observed: 1 });
+    insertMessage(source, 3, "observed-boundaries", { platformId: "null", observed: null });
+    insertMessage(source, 4, "observed-boundaries", { platformId: "negative", observed: -1 });
+    insertMessage(source, 5, "observed-boundaries", { platformId: "malformed", observed: "invalid" });
+    source.close();
+    const store = fixtureStore(root);
+    try {
+      const batch = await collect(store, [path]);
+      const kinds = Object.fromEntries(batch.inputs.map((input) => [input.nativeInputId, input.kind]));
+      expect(kinds).toEqual({
+        zero: "submission",
+        positive: "context",
+        null: "unknown",
+        negative: "unknown",
+        malformed: "unknown",
+      });
+      expect(batch.inputSourceState).toMatchObject({
+        quality: "partial",
+        reasons: expect.arrayContaining(["input-history-incomplete", "input-kind-unknown"]),
       });
     } finally {
       store.close();

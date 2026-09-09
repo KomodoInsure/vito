@@ -541,7 +541,7 @@ function selectProjection(database: Database, databasePath: string): Projection 
       let kind: InputRecord["kind"] = "unknown";
       if (role === "user" && ((observed !== null && observed > 0) || displayKind === "async_delegation_complete")) {
         kind = "context";
-      } else if (role === "user" && displayKind === null && compressedSummary === 0 && routablePlatformId) {
+      } else if (role === "user" && observed === 0 && displayKind === null && compressedSummary === 0 && routablePlatformId) {
         kind = "submission";
       }
       if (kind === "unknown" && role === "user") {

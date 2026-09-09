@@ -249,6 +249,57 @@ describe("input provenance collection", () => {
     });
   });
 
+  test("preserves contrary retained-claim conflicts when matching submissions become ambiguous", async () => {
+    const value = fixture();
+    value.store.writeBatch({ inputs: [
+      input("none-conflict", "ambiguous-none"),
+      input("source-conflict-sticky", "ambiguous-source", {
+        origin: "human",
+        originEvidence: "source",
+        controller: "native-controller",
+      }),
+    ] });
+    writeLines(value.provenance, [
+      event("ambiguous-none", "human", "controller-one"),
+      event("ambiguous-none", "automated", "controller-two"),
+      event("ambiguous-source", "human", "controller-one"),
+      event("ambiguous-source", "automated", "controller-two"),
+    ]);
+    await collectInputProvenance(value.config, value.store, { rebuild: false, cutoffMs: CUTOFF });
+    for (const originKey of ["none-conflict", "source-conflict-sticky"]) {
+      expect(storedInput(value, originKey)).toMatchObject({
+        origin: "unknown",
+        origin_evidence: "conflict",
+        controller: null,
+        reasons_json: '["input-origin-conflict"]',
+      });
+    }
+
+    value.store.writeBatch({ inputs: [
+      input("none-other-partition", "ambiguous-none", {
+        sourceKey: "codex:none-other-partition",
+        sessionKey: "none-other-session",
+      }),
+      input("source-other-partition", "ambiguous-source", {
+        sourceKey: "codex:source-other-partition",
+        sessionKey: "source-other-session",
+      }),
+    ] });
+    expect(await collectInputProvenance(
+      { ...value.config, inputProvenance: [] },
+      value.store,
+      { rebuild: false, cutoffMs: CUTOFF },
+    )).toEqual({ "input-provenance-ambiguous": 2 });
+    for (const originKey of ["none-conflict", "source-conflict-sticky"]) {
+      expect(storedInput(value, originKey)).toMatchObject({
+        origin: "unknown",
+        origin_evidence: "conflict",
+        controller: null,
+        reasons_json: '["input-origin-conflict"]',
+      });
+    }
+  });
+
   test("keeps native/feed controller disagreement null across repeated reconciliation", async () => {
     const value = fixture();
     value.store.writeBatch({ inputs: [input("controller-disagreement", "controller-disagreement", {

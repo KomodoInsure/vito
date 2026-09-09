@@ -11,6 +11,9 @@ import { scanJsonl, sourcePathKey } from "./jsonl";
 import type { AdapterBatch, AdapterContext, DiscoveryEntry, SourceAdapter } from "./types";
 
 const AGENT = "codex" as const;
+const INPUT_PARTITION_STATE_SOURCE_KEY = "codex:input-partition-state";
+const INPUT_PARTITION_GAP = "input-history-gap";
+const INPUT_PARTITION_RECORDED = "input-history-recorded";
 const UNKNOWN = "unknown";
 const SUPPORTED_ITEM_TYPES: Readonly<Record<string, "inference" | "tool">> = {
   reasoning: "inference",
@@ -946,6 +949,60 @@ function mergeCounts(target: Record<string, number>, source: Readonly<Record<str
   for (const [name, count] of Object.entries(source)) target[name] = (target[name] ?? 0) + count;
 }
 
+interface StoredInputPartitionState {
+  path_key: string;
+  tail_fingerprint: string;
+}
+
+function storedInputPartitionStates(store: AdapterContext["store"]): Map<string, string> {
+  const rows = store.database.query(`
+    SELECT path_key, tail_fingerprint
+    FROM file_cursors
+    WHERE source_key = ?
+  `).all(INPUT_PARTITION_STATE_SOURCE_KEY) as StoredInputPartitionState[];
+  return new Map(rows.map((row) => [row.path_key, row.tail_fingerprint]));
+}
+
+function inputPartitionStateCursor(
+  path: string,
+  status: typeof INPUT_PARTITION_GAP | typeof INPUT_PARTITION_RECORDED,
+  scanned?: FileCursor,
+): FileCursor | null {
+  const sourcePath = resolve(path);
+  const pathKey = sourcePathKey(INPUT_PARTITION_STATE_SOURCE_KEY, sourcePath);
+  if (scanned !== undefined) {
+    return {
+      ...scanned,
+      sourceKey: INPUT_PARTITION_STATE_SOURCE_KEY,
+      pathKey,
+      prefixFingerprint: "codex-input-partition-state-v1",
+      tailFingerprint: status,
+    };
+  }
+  try {
+    const stat = lstatSync(sourcePath);
+    const sizeBytes = Number(stat.size);
+    const mtimeMs = Math.max(0, Math.floor(stat.mtimeMs));
+    if (!stat.isFile() || !Number.isSafeInteger(sizeBytes) || sizeBytes < 0 || !Number.isSafeInteger(mtimeMs)) {
+      return null;
+    }
+    return {
+      sourceKey: INPUT_PARTITION_STATE_SOURCE_KEY,
+      pathKey,
+      sourcePath,
+      device: String(stat.dev),
+      inode: String(stat.ino),
+      byteOffset: 0,
+      sizeBytes,
+      mtimeMs,
+      prefixFingerprint: "codex-input-partition-state-v1",
+      tailFingerprint: status,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export const codexAdapter: SourceAdapter = {
   agent: AGENT,
 
@@ -1025,12 +1082,22 @@ export const codexAdapter: SourceAdapter = {
       || priorInputState === null
       || priorInputState.parser_version !== 1
       || priorInputState.last_successful_scan_ms === null;
+    const storedPartitionStates = storedInputPartitionStates(context.store);
+    const unresolvedInputPartitions = new Set(
+      [...storedPartitionStates]
+        .filter(([, status]) => status === INPUT_PARTITION_GAP)
+        .map(([pathKey]) => pathKey),
+    );
     let successfulInputScans = 0;
     let unallocatedUsageRecords = 0;
 
     for (const path of inventory.jsonl) {
+      const inputPartitionKey = sourcePathKey(INPUT_PARTITION_STATE_SOURCE_KEY, resolve(path));
       if (probeHeader(path) !== "recognized") {
         inputReasons.add("input-history-incomplete");
+        unresolvedInputPartitions.add(inputPartitionKey);
+        const partitionCursor = inputPartitionStateCursor(path, INPUT_PARTITION_GAP);
+        if (partitionCursor !== null) cursors.push(partitionCursor);
         continue;
       }
       const sourceKey = `codex:file:${hash(resolve(path))}`;
@@ -1086,6 +1153,17 @@ export const codexAdapter: SourceAdapter = {
           reasons.add("unsupported-schema");
           inputReasons.add("input-history-incomplete");
         }
+        const partitionHasInputGap = result.inputReasons.length > 0
+          || scan.diagnostics.parseGaps > 0
+          || scan.diagnostics.unsupportedSchema > 0;
+        const partitionCursor = inputPartitionStateCursor(
+          path,
+          partitionHasInputGap ? INPUT_PARTITION_GAP : INPUT_PARTITION_RECORDED,
+          scan.cursor,
+        );
+        if (partitionCursor !== null) cursors.push(partitionCursor);
+        if (partitionHasInputGap) unresolvedInputPartitions.add(inputPartitionKey);
+        else unresolvedInputPartitions.delete(inputPartitionKey);
         unallocatedUsageRecords += result.unallocatedUsageRecords;
         for (const session of result.sessions) sessions.set(session.sessionKey, session);
         for (const record of result.usage) {
@@ -1120,12 +1198,20 @@ export const codexAdapter: SourceAdapter = {
         increment(diagnostics, "parse-gap");
         reasons.add("parse-gap");
         inputReasons.add("input-history-incomplete");
+        unresolvedInputPartitions.add(inputPartitionKey);
+        const partitionCursor = inputPartitionStateCursor(path, INPUT_PARTITION_GAP);
+        if (partitionCursor !== null) cursors.push(partitionCursor);
       }
     }
+    if (unresolvedInputPartitions.size > 0) inputReasons.add("input-history-incomplete");
     if (successfulInputScans === 0) {
       inputReasons.add(inventory.jsonl.length === 0 ? "missing-source" : "input-history-incomplete");
     }
-    if (!forceInputBackfill && priorInputState?.quality === "partial") {
+    const retainUnpartitionedPriorGap = priorInputState?.quality === "partial"
+      && priorInputState.last_successful_scan_ms === null
+      && storedPartitionStates.size === 0
+      && !context.rebuild;
+    if (priorInputState?.quality === "partial" && (!forceInputBackfill || retainUnpartitionedPriorGap)) {
       for (const reason of storedInputReasons(priorInputState)) inputReasons.add(reason);
     }
     const inputs = mergeInputRecords(
