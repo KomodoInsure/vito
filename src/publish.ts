@@ -196,7 +196,7 @@ function assertMarker(path: string): void {
   parseMarker(readFileSync(path, "utf8"));
 }
 
-function privateStrings(config: Config): string[] {
+function privateStrings(config: Config, controllers: readonly string[]): string[] {
   return [
     config.stateDir,
     join(config.stateDir, "activity.sqlite"),
@@ -204,24 +204,35 @@ function privateStrings(config: Config): string[] {
     ...config.repositories.map((repository) => repository.path),
     ...(config.historicalWorkspaces ?? []).map((workspace) => workspace.path),
     ...Object.values(config.sources).flatMap((paths) => paths ?? []),
+    ...(config.inputProvenance ?? []),
+    ...controllers,
   ].filter((value, index, values) => value.length > 1 && values.indexOf(value) === index);
 }
 
-function assertPublicContent(content: string, config: Config, label: string): void {
+function retainedControllers(config: Config): string[] {
+  const store = openCollectorStore(config.stateDir);
+  try {
+    return store.listInputControllers();
+  } finally {
+    store.close();
+  }
+}
+
+function assertPublicContent(content: string, privateValues: readonly string[], label: string): void {
   if (GITHUB_TOKEN_PATTERN.test(content)) fail(`${label} contains a credential-like value`);
-  for (const value of privateStrings(config)) {
+  for (const value of privateValues) {
     if (content.includes(value) || content.includes(JSON.stringify(value).slice(1, -1))) {
       fail(`${label} contains a private configured path`);
     }
   }
 }
 
-function assertExport(exportResult: ExportResult, config: Config): void {
+function assertExport(exportResult: ExportResult, privateValues: readonly string[]): void {
   exactEntries(exportResult.outDir, EXPORT_FILES, "Generated export");
   for (const file of EXPORT_FILES) {
     const path = join(exportResult.outDir, file);
     assertRegularFile(path, `Generated asset ${file}`);
-    assertPublicContent(readFileSync(path, "utf8"), config, `Generated asset ${file}`);
+    assertPublicContent(readFileSync(path, "utf8"), privateValues, `Generated asset ${file}`);
   }
   let snapshot: unknown;
   try {
@@ -236,7 +247,11 @@ function assertExport(exportResult: ExportResult, config: Config): void {
   }
 }
 
-function assertManagedCheckout(checkout: string, exportResult?: ExportResult, config?: Config): void {
+function assertManagedCheckout(
+  checkout: string,
+  exportResult?: ExportResult,
+  privateValues?: readonly string[],
+): void {
   assertRealDirectory(checkout, "Pages checkout");
   exactEntries(checkout, [".git", ...MANAGED_ROOT_FILES], "Pages checkout");
   assertMarker(join(checkout, PAGES_MARKER_FILE));
@@ -256,7 +271,9 @@ function assertManagedCheckout(checkout: string, exportResult?: ExportResult, co
         fail(`Pages asset differs from generated export: ${file}`);
       }
     }
-    if (config !== undefined) assertPublicContent(readFileSync(published, "utf8"), config, `Pages asset ${file}`);
+    if (privateValues !== undefined) {
+      assertPublicContent(readFileSync(published, "utf8"), privateValues, `Pages asset ${file}`);
+    }
   }
   let snapshot: unknown;
   try {
@@ -501,8 +518,12 @@ async function prepareCheckout(
   fail(`Cannot compare local and remote Pages history: ${ancestor.stderr.trim() || `exit ${ancestor.exitCode}`}`);
 }
 
-function installGeneratedAssets(checkout: string, exportResult: ExportResult, config: Config): void {
-  assertExport(exportResult, config);
+function installGeneratedAssets(
+  checkout: string,
+  exportResult: ExportResult,
+  privateValues: readonly string[],
+): void {
+  assertExport(exportResult, privateValues);
   const docs = join(checkout, "docs");
   if (exists(docs)) replaceableEntries(docs, "Pages docs directory");
   else mkdirSync(docs, { mode: 0o755 });
@@ -514,16 +535,21 @@ function installGeneratedAssets(checkout: string, exportResult: ExportResult, co
   if (exists(marker)) assertMarker(marker);
   else writeFileSync(marker, MARKER_TEXT, { encoding: "utf8", flag: "wx", mode: 0o644 });
   chmodSync(marker, 0o644);
-  assertManagedCheckout(checkout, exportResult, config);
+  assertManagedCheckout(checkout, exportResult, privateValues);
 }
 
-async function stageAndValidate(git: GitTransport, checkout: string, exportResult: ExportResult, config: Config): Promise<boolean> {
+async function stageAndValidate(
+  git: GitTransport,
+  checkout: string,
+  exportResult: ExportResult,
+  privateValues: readonly string[],
+): Promise<boolean> {
   await gitCommand(git, ["add", "--", ...STAGED_PATHS], checkout);
   const names = await gitCommand(git, ["diff", "--cached", "--name-only", "--diff-filter=ACDMRTUXB", "-z"], checkout);
   const staged = names === "" ? [] : names.split("\0").filter(Boolean);
   const allowed = new Set<string>(STAGED_PATHS);
   if (staged.some((path) => !allowed.has(path))) fail("Git index contains a path outside the Vito Pages allowlist");
-  assertManagedCheckout(checkout, exportResult, config);
+  assertManagedCheckout(checkout, exportResult, privateValues);
   const difference = await gitResult(git, ["diff", "--cached", "--quiet", "--exit-code"], checkout);
   if (difference.exitCode === 0) return false;
   if (difference.exitCode === 1) return true;
@@ -652,6 +678,7 @@ async function runPublication(config: Config, options: PublishOptions, setup: bo
     pushed: false,
   };
   if (options.dryRun) return base;
+  const privacyValues = privateStrings(config, retainedControllers(config));
 
   const transport = options.transport ?? defaultPagesTransport;
   const git = options.git ?? defaultGitTransport;
@@ -659,8 +686,8 @@ async function runPublication(config: Config, options: PublishOptions, setup: bo
   if (setup) await requireDedicatedRepository(config, transport);
   const existingPages = await inspectPages(config, transport, setup);
   const prepared = await prepareCheckout(config, git, repository.cloneUrl, setup);
-  installGeneratedAssets(prepared.checkout, exportResult, config);
-  const changed = await stageAndValidate(git, prepared.checkout, exportResult, config);
+  installGeneratedAssets(prepared.checkout, exportResult, privacyValues);
+  const changed = await stageAndValidate(git, prepared.checkout, exportResult, privacyValues);
   let commit = prepared.local;
   if (changed) commit = await commitChanges(git, prepared.checkout, prepared.pending);
   if (commit === null) fail("Pages checkout has no publishable commit");

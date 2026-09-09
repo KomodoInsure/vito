@@ -15,6 +15,7 @@ import { join } from "node:path";
 import type { Config } from "../src/config";
 import { publicSnapshotSchema } from "../src/contracts";
 import { EXPORT_FILES } from "../src/export";
+import { CollectorStore } from "../src/store";
 import {
   defaultGitTransport,
   PAGES_MARKER,
@@ -420,6 +421,69 @@ describe("Pages publisher", () => {
     expect(readPublicationState(value.config)?.commit).toBe(recovered.commit);
   }, 30_000);
 
+
+  test("rejects a provenance path leaked into generated assets before publication", async () => {
+    const value = fixture();
+    const provenanceDirectory = join(value.root, "provenance");
+    const provenancePath = join(provenanceDirectory, "PRIVATE_PROVENANCE_SENTINEL.jsonl");
+    mkdirSync(provenanceDirectory);
+    writeFileSync(provenancePath, "");
+    value.config.inputProvenance = [provenancePath];
+    let mutated = false;
+    const transport: PagesTransport = {
+      async request(method, path, body) {
+        if (!mutated) {
+          mutated = true;
+          appendFileSync(join(value.state, "export", "styles.css"), `\\n${provenancePath}\\n`);
+        }
+        return value.pages.request(method, path, body);
+      },
+    };
+
+    await expect(setupPages(value.config, {
+      at: CUTOFF,
+      transport,
+      git: defaultGitTransport,
+    })).rejects.toThrow(/private configured path/i);
+    expect(readdirSync(join(value.remote, "refs", "heads"))).toEqual([]);
+  }, 30_000);
+
+  test("rejects a retained controller name leaked after export and before publication", async () => {
+    const value = fixture();
+    const controller = "PRIVATE_PUBLISH_CONTROLLER_SENTINEL";
+    const store = CollectorStore.open(value.state);
+    try {
+      store.writeBatch({
+        inputProvenance: [{
+          originKey: "ignored-by-store",
+          agent: "codex",
+          nativeSessionId: "session",
+          nativeInputId: "input",
+          origin: "human",
+          controller,
+        }],
+      });
+    } finally {
+      store.close();
+    }
+    let mutated = false;
+    const transport: PagesTransport = {
+      async request(method, path, body) {
+        if (!mutated) {
+          mutated = true;
+          appendFileSync(join(value.state, "export", "styles.css"), `\\n${controller}\\n`);
+        }
+        return value.pages.request(method, path, body);
+      },
+    };
+
+    await expect(setupPages(value.config, {
+      at: CUTOFF,
+      transport,
+      git: defaultGitTransport,
+    })).rejects.toThrow(/private configured path/i);
+    expect(readdirSync(join(value.remote, "refs", "heads"))).toEqual([]);
+  }, 30_000);
   test("requires an existing public dedicated repository and preserves unrelated destinations", async () => {
     const value = fixture();
 

@@ -262,6 +262,43 @@ describe("static export", () => {
       buildSnapshot: () => nonfinite,
     })).toThrow(/validation failed/i);
   });
+
+  test("protects configured provenance paths and retained controller names from export", () => {
+    const value = fixture();
+    const cutoffMs = Date.parse("2026-09-06T12:00:00.000Z");
+    const provenanceDirectory = join(value.root, "private-provenance");
+    const provenancePath = join(provenanceDirectory, "events.jsonl");
+    mkdirSync(provenanceDirectory);
+    writeFileSync(provenancePath, "");
+    value.config.inputProvenance = [provenancePath];
+
+    expect(() => exportStaticSite(value.config, value.store, {
+      outDir: provenanceDirectory,
+      at: cutoffMs,
+      assetsDir: value.assets,
+      buildSnapshot: () => snapshot(cutoffMs),
+    })).toThrow(/overlaps protected source/i);
+
+    const controller = "PRIVATE_CONTROLLER_SENTINEL";
+    value.store.writeBatch({
+      inputProvenance: [{
+        originKey: "ignored-by-store",
+        agent: "codex",
+        nativeSessionId: "session",
+        nativeInputId: "input",
+        origin: "human",
+        controller,
+      }],
+    });
+    const leaked = snapshot(cutoffMs);
+    leaked.organization = controller;
+    expect(() => exportStaticSite(value.config, value.store, {
+      outDir: join(value.root, "controller-leak-export"),
+      at: cutoffMs,
+      assetsDir: value.assets,
+      buildSnapshot: () => leaked,
+    })).toThrow(/private configured path/i);
+  });
 });
 
 describe("static preview", () => {

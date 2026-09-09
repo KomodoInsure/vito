@@ -22,6 +22,7 @@ import { codexAdapter } from "./sources/codex";
 import { hermesAdapter } from "./sources/hermes";
 import { ompAdapter } from "./sources/omp";
 import { opencodeAdapter } from "./sources/opencode";
+import { collectInputProvenance } from "./sources/provenance";
 import type { AdapterBatch, AdapterContext, SourceAdapter } from "./sources/types";
 
 export const SOURCE_ADAPTERS: readonly SourceAdapter[] = [
@@ -554,6 +555,7 @@ export async function collectIntoStore(
   let excludedAmbiguousRecords = 0;
   let excludedUnattributedRecords = 0;
   let adaptersCollected = 0;
+  let provenanceDiagnosticCounts: Record<string, number> = {};
   try {
     for (const adapter of adapters) {
       const context: AdapterContext = {
@@ -623,6 +625,15 @@ export async function collectIntoStore(
       }
     }
 
+    provenanceDiagnosticCounts = await collectInputProvenance(config, store, { rebuild, cutoffMs });
+    if (
+      (provenanceDiagnosticCounts["input-provenance-unreadable"] ?? 0) > 0
+      || (provenanceDiagnosticCounts["input-provenance-unsupported"] ?? 0) > 0
+      || (provenanceDiagnosticCounts["input-provenance-parse-gap"] ?? 0) > 0
+    ) {
+      status = "partial";
+    }
+
     const completedAtMs = Math.max(startedAtMs, Date.now());
     store.writeBatch({
       collectionRuns: [{
@@ -637,6 +648,7 @@ export async function collectIntoStore(
           "unallocated-history": unallocatedUsageRecords,
           "duplicate-ambiguity": excludedAmbiguousRecords,
           "unattributed-session": excludedUnattributedRecords,
+          ...provenanceDiagnosticCounts,
         },
       }],
     });

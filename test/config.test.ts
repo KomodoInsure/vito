@@ -61,6 +61,7 @@ describe("configuration initialization", () => {
     expect(initialized.config.companyName).toBe("Komodo");
     expect(initialized.config.workspaceRoots).toEqual([realpathSync(paths.workspace)]);
     expect(initialized.config.sources).toEqual({});
+    expect(initialized.config.inputProvenance).toEqual([]);
     expect(statSync(paths.configPath).mode & 0o777).toBe(0o600);
     expect(statSync(paths.stateDir).mode & 0o777).toBe(0o700);
     expect(loadConfig(paths.configPath)).toEqual(initialized.config);
@@ -163,6 +164,49 @@ describe("configuration initialization", () => {
     writeFileSync(paths.configPath, `${JSON.stringify(unsafe)}\n`);
     chmodSync(paths.configPath, 0o600);
     expect(() => loadConfig(paths.configPath)).toThrow("overlaps protected");
+  });
+
+  test("canonicalizes provenance paths and rejects their private-location overlaps", () => {
+    const paths = fixturePaths();
+    mkdirSync(join(paths.root, "private"), { recursive: true });
+    const provenanceDirectory = join(paths.root, "provenance");
+    const provenancePath = join(provenanceDirectory, "events.jsonl");
+    mkdirSync(provenanceDirectory);
+    writeFileSync(provenancePath, "");
+    const candidate = {
+      version: 1 as const,
+      workspaceRoots: [paths.workspace],
+      timezone: "UTC",
+      stateDir: paths.stateDir,
+      sources: {},
+      repositories: [],
+      historicalWorkspaces: [],
+      inputProvenance: [provenancePath, join(provenanceDirectory, ".", "events.jsonl")],
+      publication: { repository: "komodorisk/activity", branch: "main" as const },
+    };
+    writeFileSync(paths.configPath, `${JSON.stringify(candidate)}\n`, { mode: 0o600 });
+
+    const loaded = loadConfig(paths.configPath);
+    expect(loaded.inputProvenance).toEqual([realpathSync(provenancePath)]);
+    expect(() => validateOutputPath(loaded, provenanceDirectory)).toThrow("overlaps protected");
+
+    writeFileSync(paths.configPath, `${JSON.stringify({
+      ...candidate,
+      stateDir: provenanceDirectory,
+    })}\n`, { mode: 0o600 });
+    expect(() => loadConfig(paths.configPath)).toThrow("overlaps protected");
+
+    const repository = join(paths.workspace, "repository");
+    mkdirSync(repository);
+    writeFileSync(paths.configPath, `${JSON.stringify({
+      ...candidate,
+      historicalWorkspaces: [{
+        path: provenanceDirectory,
+        repositoryPath: repository,
+        match: "descendants",
+      }],
+    })}\n`, { mode: 0o600 });
+    expect(() => loadConfig(paths.configPath)).toThrow("overlaps private source");
   });
 
   test("distinguishes absent source configuration from an explicit empty list", () => {

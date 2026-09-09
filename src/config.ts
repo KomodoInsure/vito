@@ -38,6 +38,7 @@ export interface Config {
   sources: Partial<Record<Agent, string[]>>;
   repositories: RepositoryConfig[];
   historicalWorkspaces?: HistoricalWorkspaceConfig[];
+  inputProvenance?: string[];
   publication: { repository: string; branch: "main" };
 }
 
@@ -114,6 +115,7 @@ export const configSchema: z.ZodType<Config> = z
     sources: sourcesSchema,
     repositories: z.array(repositoryConfigSchema),
     historicalWorkspaces: z.array(historicalWorkspaceConfigSchema).optional().default([]),
+    inputProvenance: z.array(absoluteNormalizedPathSchema).optional().default([]),
     publication: z
       .object({
         repository: z.string().refine(isValidGitHubRepository, "Expected owner/repository"),
@@ -195,14 +197,18 @@ function validatePrivateLocations(
   stateDir: string,
   workspaceRoots: string[],
   sources: Partial<Record<Agent, string[]>>,
+  inputProvenance: string[],
   repositories: RepositoryConfig[],
   historicalWorkspaces: HistoricalWorkspaceConfig[],
 ): void {
-  const sourcePaths = AGENTS.flatMap((agent) => sources[agent] ?? []);
+  const privateSourcePaths = [
+    ...AGENTS.flatMap((agent) => sources[agent] ?? []),
+    ...inputProvenance,
+  ];
   const protectedPaths = [
     ...workspaceRoots,
     ...repositories.map((repository) => repository.path),
-    ...sourcePaths,
+    ...privateSourcePaths,
     ...historicalWorkspaces.map((workspace) => workspace.path),
   ];
   for (const protectedPath of protectedPaths) {
@@ -211,7 +217,7 @@ function validatePrivateLocations(
     }
   }
   for (const historical of historicalWorkspaces) {
-    for (const sourcePath of sourcePaths) {
+    for (const sourcePath of privateSourcePaths) {
       if (pathsOverlap(historical.path, sourcePath)) {
         throw new ConfigError(`Historical workspace overlaps private source path: ${historical.path}`);
       }
@@ -228,6 +234,15 @@ function canonicalizeConfig(config: Config): Config {
     if (!Object.prototype.hasOwnProperty.call(config.sources, agent)) continue;
     const configured = config.sources[agent] ?? [];
     sources[agent] = configured.map((sourcePath) => canonicalizePotentialPath(sourcePath, `${agent} source path`));
+  }
+
+  const inputProvenance: string[] = [];
+  const seenProvenance = new Set<string>();
+  for (const provenancePath of config.inputProvenance ?? []) {
+    const canonical = canonicalizePotentialPath(provenancePath, "input provenance path");
+    if (seenProvenance.has(canonical)) continue;
+    seenProvenance.add(canonical);
+    inputProvenance.push(canonical);
   }
 
   const repositories = config.repositories.map((repository) => {
@@ -263,7 +278,7 @@ function canonicalizeConfig(config: Config): Config {
     }
   }
 
-  validatePrivateLocations(stateDir, workspaceRoots, sources, repositories, historicalWorkspaces);
+  validatePrivateLocations(stateDir, workspaceRoots, sources, inputProvenance, repositories, historicalWorkspaces);
   return {
     version: 1,
     companyName: config.companyName ?? "Komodo Risk Inc",
@@ -271,6 +286,7 @@ function canonicalizeConfig(config: Config): Config {
     timezone: config.timezone,
     stateDir,
     sources,
+    inputProvenance,
     repositories,
     historicalWorkspaces,
     publication: { repository: config.publication.repository, branch: "main" },
@@ -331,7 +347,7 @@ export function initializeConfig(input: InitializeConfigInput): { configPath: st
   const timezone = input.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
   if (!timezone || !isValidIanaTimezone(timezone)) throw new ConfigError(`Invalid IANA timezone: ${timezone || "(empty)"}`);
   const stateDir = canonicalizePotentialPath(input.stateDir ?? getDefaultStateDir(), "state directory");
-  validatePrivateLocations(stateDir, workspaceRoots, {}, [], []);
+  validatePrivateLocations(stateDir, workspaceRoots, {}, [], [], []);
 
   const config: Config = {
     version: 1,
@@ -341,6 +357,7 @@ export function initializeConfig(input: InitializeConfigInput): { configPath: st
     stateDir,
     sources: {},
     repositories: [],
+    inputProvenance: [],
     historicalWorkspaces: [],
     publication: { repository: input.pagesRepository, branch: "main" },
   };
@@ -379,6 +396,7 @@ export function validateOutputPath(config: Config, outputPath: string): string {
     ...config.workspaceRoots,
     ...config.repositories.map((repository) => repository.path),
     ...AGENTS.flatMap((agent) => config.sources[agent] ?? []),
+    ...(config.inputProvenance ?? []),
   ];
   for (const protectedPath of protectedPaths) {
     if (pathsOverlap(canonicalOutput, protectedPath)) {

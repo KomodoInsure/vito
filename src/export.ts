@@ -117,6 +117,7 @@ function protectedOutputPaths(config: Config): string[] {
     ...config.repositories.map((repository) => repository.path),
     ...(config.historicalWorkspaces ?? []).map((workspace) => workspace.path),
     ...Object.values(config.sources).flatMap((paths) => paths ?? []),
+    ...(config.inputProvenance ?? []),
   ].map((path) => canonicalizePotentialPath(path, "protected source or repository path"));
 }
 
@@ -251,11 +252,13 @@ function privateStrings(config: Config, store: CollectorStore): string[] {
     ...config.repositories.map((repository) => repository.path),
     ...(config.historicalWorkspaces ?? []).map((workspace) => workspace.path),
     ...Object.values(config.sources).flatMap((paths) => paths ?? []),
+    ...(config.inputProvenance ?? []),
+    ...store.listInputControllers(),
   ].filter((value, index, values) => value.length > 1 && values.indexOf(value) === index);
 }
 
-function assertNoPrivateStrings(content: string, config: Config, store: CollectorStore): void {
-  for (const value of privateStrings(config, store)) {
+function assertNoPrivateStrings(content: string, privateValues: readonly string[]): void {
+  for (const value of privateValues) {
     if (content.includes(value) || content.includes(JSON.stringify(value).slice(1, -1))) {
       fail("Public snapshot contains a private configured path");
     }
@@ -281,8 +284,9 @@ function stageExport(
 
   writeFileSync(join(stagingDirectory, ".nojekyll"), "", { encoding: "utf8", flag: "wx", mode: 0o644 });
   chmodSync(join(stagingDirectory, ".nojekyll"), 0o644);
+  const privateValues = privateStrings(config, store);
   const serialized = `${JSON.stringify(snapshot, null, 2)}\n`;
-  assertNoPrivateStrings(serialized, config, store);
+  assertNoPrivateStrings(serialized, privateValues);
   writeFileSync(join(stagingDirectory, "activity.json"), serialized, { encoding: "utf8", flag: "wx", mode: 0o644 });
   chmodSync(join(stagingDirectory, "activity.json"), 0o644);
 
@@ -292,7 +296,7 @@ function stageExport(
   if (!validated.success) fail(`Staged activity.json failed validation: ${validated.error.message}`);
   for (const file of EXPORT_FILES) {
     const content = readFileSync(join(stagingDirectory, file), "utf8");
-    assertNoPrivateStrings(content, config, store);
+    assertNoPrivateStrings(content, privateValues);
   }
 }
 

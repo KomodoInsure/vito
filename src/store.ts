@@ -1015,6 +1015,16 @@ export class CollectorStore {
     return this.database.query("SELECT * FROM input_source_state WHERE source_key = ?").get(sourceKey) as Record<string, unknown> | null;
   }
 
+  listInputControllers(): string[] {
+    const rows = this.database.query(`
+      SELECT controller FROM input_events WHERE controller IS NOT NULL
+      UNION
+      SELECT controller FROM input_provenance WHERE controller IS NOT NULL
+      ORDER BY controller
+    `).all() as Array<{ controller: string }>;
+    return rows.map((row) => row.controller);
+  }
+
   getCounterSnapshot(sourceKey: string, counterKey: string): Record<string, unknown> | null {
     requireText(sourceKey, "sourceKey");
     requireText(counterKey, "counterKey");
