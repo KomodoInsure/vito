@@ -4,7 +4,8 @@ import { homedir } from "node:os";
 import { basename, extname, join, normalize } from "node:path";
 
 import { configuredSourcePaths, type Config } from "../config";
-import type { UsageRecord } from "../contracts";
+import type { InputRecord, Quality, UsageRecord } from "../contracts";
+import { mergeInputRecords, retainedInputRecords, storedInputReasons } from "../inputs";
 import type { FileCursor, SessionRecord } from "../store";
 import { scanJsonl, sourcePathKey } from "./jsonl";
 import type { AdapterBatch, AdapterContext, DiscoveryEntry, SourceAdapter } from "./types";
@@ -23,6 +24,9 @@ export interface ClaudeRawRecord {
 export interface ClaudeNormalization {
   sessions: SessionRecord[];
   usage: UsageRecord[];
+  inputs: InputRecord[];
+  inputQuality: Quality;
+  inputReasons: string[];
   workIntervals: [];
   diagnosticCounts: Record<string, number>;
   unallocatedUsageRecords: number;
@@ -260,6 +264,83 @@ function sessionFromRecord(raw: ClaudeRawRecord): SessionObservation | null {
   };
 }
 
+function inputFromRecord(raw: ClaudeRawRecord, cutoffMs: number): { input: InputRecord | null; reason: string | null } {
+  const record = object(raw.record);
+  const message = object(record?.message);
+  if (!record || record.type !== "user" || message?.role !== "user") return { input: null, reason: null };
+  const sessionId = text(record.sessionId);
+  if (sessionId === null) return { input: null, reason: "input-history-incomplete" };
+  const nativeInputId = text(record.uuid);
+  if (nativeInputId === null) return { input: null, reason: "input-history-incomplete" };
+  const atMs = timestamp(record.timestamp);
+  if (atMs !== null && atMs > cutoffMs) return { input: null, reason: null };
+  const agentId = text(record.agentId);
+  const originKind = text(object(record.origin)?.kind);
+  const content = message.content;
+  let kind: InputRecord["kind"] = "unknown";
+  let origin: InputRecord["origin"] = "unknown";
+  let originEvidence: InputRecord["originEvidence"] = "none";
+
+  const contentBlocks = Array.isArray(content) ? content.map(object) : null;
+  const blockTypes = contentBlocks?.map((block) => text(block?.type));
+  const toolOnly = blockTypes !== undefined
+    && blockTypes.length > 0
+    && blockTypes.every((type) => type === "tool_result" || type === "tool_use");
+  if (record.toolUseResult !== undefined || toolOnly || originKind === "task-notification") {
+    kind = "context";
+  } else if (text(record.interruptedMessageId) !== null) {
+    kind = "context";
+  } else if (text(record.scheduledTaskId) !== null && text(record.scheduledFireId) !== null) {
+    kind = "submission";
+    origin = "automated";
+    originEvidence = "source";
+  } else if (originKind === "human") {
+    kind = "submission";
+    origin = "human";
+    originEvidence = "source";
+  } else if (originKind === "peer" || originKind === "coordinator" || originKind === "auto-continuation") {
+    kind = "submission";
+    origin = "automated";
+    originEvidence = "source";
+  } else if (record.isMeta === true || record.isSynthetic === true) {
+    kind = "context";
+  } else if (typeof content === "string") {
+    kind = content.length > 0 ? "submission" : "context";
+  } else if (contentBlocks !== null) {
+    if (contentBlocks.length === 0 || toolOnly) {
+      kind = "context";
+    } else if (
+      contentBlocks.every((block) => block !== null)
+      && blockTypes?.every((type) => type === "text" || type === "image")
+    ) {
+      kind = "submission";
+    }
+  }
+
+  const reason = kind === "unknown" ? "input-kind-unknown" : null;
+  return {
+    input: {
+      originKey: `claude:input:${digest(nativeInputId)}`,
+      sourceKey: SOURCE_KEY,
+      agent: AGENT,
+      sessionKey: laneKey(sessionId, agentId),
+      nativeSessionId: sessionId,
+      nativeInputId,
+      workspaceKey: eventWorkspace(record) ?? `claude:unattributed:${digest(sessionId)}`,
+      repositoryKey: null,
+      atMs,
+      kind,
+      lane: record.isSidechain === true || agentId !== null ? "subagent" : "main",
+      controller: null,
+      origin,
+      originEvidence,
+      quality: kind === "unknown" ? "partial" : "recorded",
+      reasons: reason === null ? [] : [reason],
+    },
+    reason,
+  };
+}
+
 /**
  * Pure normalization over projected JSONL records. Raw transcript blocks are used
  * only during this call and never copied into a returned record.
@@ -267,12 +348,17 @@ function sessionFromRecord(raw: ClaudeRawRecord): SessionObservation | null {
 export function normalizeClaudeRecords(records: readonly ClaudeRawRecord[], cutoffMs = Number.MAX_SAFE_INTEGER): ClaudeNormalization {
   const sessionsByKey = new Map<string, SessionObservation[]>();
   const responsesByOrigin = new Map<string, ResponseObservation[]>();
+  const inputCandidates: InputRecord[] = [];
+  const inputReasons = new Set<string>();
   let ignoredParentSummaries = 0;
   let malformedUsage = 0;
 
   records.forEach((raw, sequence) => {
     const record = object(raw.record);
     if (!record) return;
+    const normalizedInput = inputFromRecord(raw, cutoffMs);
+    if (normalizedInput.input !== null) inputCandidates.push(normalizedInput.input);
+    if (normalizedInput.reason !== null) inputReasons.add(normalizedInput.reason);
     const session = sessionFromRecord(raw);
     if (session && (session.atMs === null || session.atMs <= cutoffMs)) {
       const observations = sessionsByKey.get(session.sessionKey) ?? [];
@@ -396,10 +482,19 @@ export function normalizeClaudeRecords(records: readonly ClaudeRawRecord[], cuto
   }
 
   usage.sort((first, second) => first.originKey.localeCompare(second.originKey));
+  const inputs = mergeInputRecords(inputCandidates).map((input) => {
+    const owner = selectedSessions.get(input.sessionKey);
+    if (owner?.workspaceKey) input.workspaceKey = owner.workspaceKey;
+    return input;
+  });
+  if (inputs.some((input) => input.kind === "unknown")) inputReasons.add("input-kind-unknown");
   const unallocatedUsageRecords = usage.filter((entry) => entry.atMs === null).length;
   return {
     sessions,
     usage,
+    inputs,
+    inputQuality: inputReasons.size === 0 ? "recorded" : "partial",
+    inputReasons: [...inputReasons].sort(),
     workIntervals: [],
     diagnosticCounts: {
       assistantResponses: usage.length,
@@ -566,12 +661,19 @@ export const claudeAdapter: SourceAdapter = {
     let parseGaps = 0;
     let unterminatedTailBytes = 0;
     let readFailures = 0;
+    const priorInputState = context.store.getInputSourceState(SOURCE_KEY);
+    const forceInputBackfill = context.rebuild
+      || context.reconcileAll
+      || priorInputState === null
+      || priorInputState.parser_version !== 1
+      || priorInputState.last_successful_scan_ms === null;
+    let successfulInputScans = 0;
 
     for (const path of found.files) {
       try {
         const stat = await lstat(path);
         const pathKey = sourcePathKey(SOURCE_KEY, path);
-        const previousCursor = context.rebuild ? null : context.store.getFileCursor(SOURCE_KEY, pathKey);
+        const previousCursor = forceInputBackfill ? null : context.store.getFileCursor(SOURCE_KEY, pathKey);
         const result = await scanJsonl({
           sourceKey: SOURCE_KEY,
           pathKey,
@@ -593,6 +695,7 @@ export const claudeAdapter: SourceAdapter = {
         fileCursors.push(result.cursor);
         parseGaps += result.diagnostics.parseGaps;
         unterminatedTailBytes += result.diagnostics.unterminatedTailBytes;
+        successfulInputScans += 1;
       } catch {
         readFailures += 1;
       }
@@ -643,6 +746,39 @@ export const claudeAdapter: SourceAdapter = {
       record.reasons = record.reasons.filter((reason) => reason !== "unattributed-session");
       record.quality = record.reasons.length === 0 ? "recorded" : "partial";
     }
+    const currentInputs = normalized.inputs.map((input) => {
+      const session = sessions.get(input.sessionKey);
+      const workspace = session ? resolveWorkspace(session) : null;
+      if (workspace !== null) input.workspaceKey = workspace;
+      return input;
+    });
+    const inputs = mergeInputRecords(
+      currentInputs,
+      retainedInputRecords(context.store, currentInputs.map((record) => record.originKey)),
+    );
+    const inputReasons = new Set(normalized.inputReasons);
+    if (successfulInputScans === 0 && found.files.length === 0) inputReasons.add("missing-source");
+    if (parseGaps > 0 || readFailures > 0 || unterminatedTailBytes > 0) {
+      inputReasons.add("input-history-incomplete");
+    }
+    if (!forceInputBackfill && priorInputState?.quality === "partial") {
+      for (const reason of storedInputReasons(priorInputState)) inputReasons.add(reason);
+    }
+    const inputQuality: Quality = successfulInputScans === 0
+      ? "unavailable"
+      : inputReasons.size > 0 ? "partial" : "recorded";
+    const previousSuccessfulScan = typeof priorInputState?.last_successful_scan_ms === "number"
+      ? priorInputState.last_successful_scan_ms
+      : null;
+    const inputSourceState = {
+      sourceKey: SOURCE_KEY,
+      agent: AGENT,
+      parserVersion: 1 as const,
+      quality: inputQuality,
+      reasons: [...inputReasons].sort(),
+      scannedAtMs: context.cutoffMs,
+      lastSuccessfulScanMs: successfulInputScans > 0 ? context.cutoffMs : previousSuccessfulScan,
+    };
 
 
     const diagnosticCounts = {
@@ -681,6 +817,8 @@ export const claudeAdapter: SourceAdapter = {
       sessions: [...sessions.values()].sort((first, second) => first.sessionKey.localeCompare(second.sessionKey)),
       usage: mergedUsage,
       workIntervals: [],
+      inputs,
+      inputSourceState,
       counterSnapshots: [],
       fileCursors,
       unallocatedUsageRecords: mergedUsage.filter((record) => record.atMs === null).length,

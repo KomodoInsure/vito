@@ -6,7 +6,8 @@ import { Database } from "bun:sqlite";
 import { Temporal } from "@js-temporal/polyfill";
 
 import type { Config } from "../config";
-import type { Quality, UsageRecord } from "../contracts";
+import type { InputRecord, Quality, UsageRecord } from "../contracts";
+import { mergeInputRecords, retainedInputRecords } from "../inputs";
 import type { CounterSnapshot, SessionRecord, SourceRecord } from "../store";
 import type { AdapterBatch, AdapterContext, DiscoveryEntry, SourceAdapter } from "./types";
 
@@ -40,6 +41,9 @@ export interface HermesCost {
 interface ProjectedSession {
   databasePath: string;
   rawId: string;
+  source: string;
+  chatId: string | null;
+  threadId: string | null;
   parentId: string | null;
   startedMs: number;
   endedMs: number | null;
@@ -71,6 +75,9 @@ interface ProjectedCounter {
 
 interface Projection {
   sessions: ProjectedSession[];
+  inputs: InputRecord[];
+  inputSupported: boolean;
+  inputReasons: string[];
   schemaVersion: string;
   parseGaps: number;
 }
@@ -366,7 +373,9 @@ function tableNames(database: Database): Set<string> {
 }
 
 function columnNames(database: Database, table: string): Set<string> {
-  if (table !== "sessions" && table !== "session_model_usage" && table !== "schema_version") return new Set();
+  if (table !== "sessions" && table !== "session_model_usage" && table !== "schema_version" && table !== "messages") {
+    return new Set();
+  }
   return new Set((database.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((row) => row.name));
 }
 
@@ -379,8 +388,8 @@ function selectProjection(database: Database, databasePath: string): Projection 
   }
 
   const sessionAllowlist = [
-    "id", "source", "parent_session_id", "model", "started_at", "ended_at", "last_activity_at", "cwd", "git_repo_root",
-    ...TOKEN_COLUMNS, "estimated_cost_usd", "actual_cost_usd", "cost_status", "cost_source",
+    "id", "source", "chat_id", "thread_id", "parent_session_id", "model", "started_at", "ended_at", "last_activity_at",
+    "cwd", "git_repo_root", ...TOKEN_COLUMNS, "estimated_cost_usd", "actual_cost_usd", "cost_status", "cost_source",
   ];
   const selectedSessionColumns = sessionAllowlist.filter((column) => sessionColumns.has(column));
   const sessionRows = database.query(`SELECT ${selectedSessionColumns.join(", ")} FROM sessions`).all() as SqlRow[];
@@ -460,6 +469,9 @@ function selectProjection(database: Database, databasePath: string): Projection 
     const providerValue = text(row.billing_provider).trim();
     sessions.push({
       databasePath,
+      source: text(row.source),
+      chatId: nullableText(row.chat_id),
+      threadId: nullableText(row.thread_id),
       rawId,
       parentId: nullableText(row.parent_session_id),
       startedMs,
@@ -480,13 +492,125 @@ function selectProjection(database: Database, databasePath: string): Projection 
       copyConflict: false,
     });
   }
+  const requiredMessageColumns = [
+    "id", "session_id", "role", "timestamp", "platform_message_id", "observed",
+    "active", "compacted", "display_kind", "_compressed_summary",
+  ];
+  const messageColumns = tables.has("messages") ? columnNames(database, "messages") : new Set<string>();
+  const inputSupported = requiredMessageColumns.every((column) => messageColumns.has(column));
+  const inputReasons = new Set<string>();
+  const projectedInputs: Array<{ input: InputRecord; role: string }> = [];
+  if (inputSupported) {
+    const messageRows = database.query(`
+      SELECT id, session_id, role, timestamp, platform_message_id, observed,
+        active, compacted, display_kind, _compressed_summary
+      FROM messages
+    `).all() as SqlRow[];
+    const sessionById = new Map(sessions.map((session) => [session.rawId, session]));
+    for (const row of messageRows) {
+      const sessionId = nullableText(row.session_id);
+      const rowId = nonnegativeInteger(row.id);
+      if (sessionId === null || rowId === null) {
+        inputReasons.add("input-history-incomplete");
+        continue;
+      }
+      const session = sessionById.get(sessionId);
+      if (session === undefined) {
+        inputReasons.add("input-history-incomplete");
+        continue;
+      }
+      const role = text(row.role);
+      const platformId = nullableText(row.platform_message_id);
+      const atMs = secondsToMilliseconds(row.timestamp);
+      if (row.timestamp !== null && row.timestamp !== undefined && atMs === null) {
+        inputReasons.add("input-history-incomplete");
+      }
+      const displayKind = nullableText(row.display_kind);
+      const observed = nonnegativeInteger(row.observed);
+      const compressedSummary = nonnegativeInteger(row._compressed_summary);
+      const routablePlatformId = platformId !== null && session.source.length > 0 && session.chatId !== null;
+      if (role !== "user" && !routablePlatformId) continue;
+
+      let kind: InputRecord["kind"] = "unknown";
+      if (role === "user" && ((observed !== null && observed > 0) || displayKind === "async_delegation_complete")) {
+        kind = "context";
+      } else if (role === "user" && displayKind === null && compressedSummary === 0 && routablePlatformId) {
+        kind = "submission";
+      }
+      if (kind === "unknown") {
+        inputReasons.add("input-kind-unknown");
+        inputReasons.add("input-history-incomplete");
+      }
+      const nativeInputId = routablePlatformId ? platformId : String(rowId);
+      const originKey = routablePlatformId
+        ? `hermes:input:${stableDigest([session.source, session.chatId, session.threadId ?? "", platformId])}`
+        : `hermes:input-candidate:${stableDigest([databasePath, rowId])}`;
+      projectedInputs.push({
+        role,
+        input: {
+          originKey,
+          sourceKey: SOURCE_KEY,
+          agent: "hermes",
+          sessionKey: `hermes:${session.rawId}`,
+          nativeSessionId: session.rawId,
+          nativeInputId,
+          workspaceKey: session.workspace ?? session.repository ?? "unattributed:hermes",
+          repositoryKey: session.repository,
+          atMs,
+          kind,
+          lane: session.parentId === null ? "main" : "unknown",
+          controller: null,
+          origin: "unknown",
+          originEvidence: "none",
+          quality: kind === "unknown" ? "partial" : "recorded",
+          reasons: kind === "unknown" ? ["input-kind-unknown"] : [],
+        },
+      });
+    }
+  } else {
+    inputReasons.add("input-history-incomplete");
+  }
+
+  const inputs: InputRecord[] = [];
+  const inputsByOrigin = new Map<string, Array<{ input: InputRecord; role: string }>>();
+  for (const candidate of projectedInputs) {
+    const bucket = inputsByOrigin.get(candidate.input.originKey) ?? [];
+    bucket.push(candidate);
+    inputsByOrigin.set(candidate.input.originKey, bucket);
+  }
+  for (const bucket of inputsByOrigin.values()) {
+    if (!bucket.some((candidate) => candidate.role === "user")) continue;
+    const ordered = [...bucket].sort((left, right) =>
+      (left.input.atMs ?? Number.MAX_SAFE_INTEGER) - (right.input.atMs ?? Number.MAX_SAFE_INTEGER)
+      || left.input.sessionKey.localeCompare(right.input.sessionKey));
+    const selected = { ...ordered[0]!.input, reasons: [...ordered[0]!.input.reasons] };
+    const timestamps = new Set(bucket
+      .map((candidate) => candidate.input.atMs)
+      .filter((value): value is number => value !== null));
+    if (timestamps.size > 1 || bucket.some((candidate) => candidate.role !== "user")) {
+      selected.kind = "unknown";
+      selected.quality = "partial";
+      selected.reasons = ["input-kind-unknown"];
+      inputReasons.add("input-kind-unknown");
+      inputReasons.add("input-history-incomplete");
+    }
+    inputs.push(selected);
+  }
+  inputs.sort((left, right) => left.originKey.localeCompare(right.originKey));
 
   let schemaVersion = "unknown";
   if (tables.has("schema_version") && columnNames(database, "schema_version").has("version")) {
     const version = database.query("SELECT version FROM schema_version ORDER BY rowid DESC LIMIT 1").get() as { version?: unknown } | null;
     if (version?.version !== undefined) schemaVersion = String(version.version);
   }
-  return { sessions, schemaVersion, parseGaps };
+  return {
+    sessions,
+    inputs,
+    inputSupported,
+    inputReasons: [...inputReasons].sort(),
+    schemaVersion,
+    parseGaps,
+  };
 }
 
 function projectDatabase(databasePath: string): Projection {
@@ -739,6 +863,68 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
       else unreadable += 1;
     }
   }
+  const inputReasons = new Set(projections.flatMap((projection) => projection.inputReasons));
+  if (unsupported > 0 || unreadable > 0) inputReasons.add("input-history-incomplete");
+  const currentInputs: InputRecord[] = [];
+  const inputsByOrigin = new Map<string, InputRecord[]>();
+  for (const input of projections.flatMap((projection) => projection.inputs)
+    .filter((record) => record.atMs === null || record.atMs <= context.cutoffMs)) {
+    const bucket = inputsByOrigin.get(input.originKey) ?? [];
+    bucket.push(input);
+    inputsByOrigin.set(input.originKey, bucket);
+  }
+  for (const bucket of inputsByOrigin.values()) {
+    const ordered = [...bucket].sort((left, right) =>
+      (left.atMs ?? Number.MAX_SAFE_INTEGER) - (right.atMs ?? Number.MAX_SAFE_INTEGER)
+      || left.sessionKey.localeCompare(right.sessionKey)
+      || left.nativeInputId.localeCompare(right.nativeInputId));
+    const selected = { ...ordered[0]!, reasons: [...ordered[0]!.reasons] };
+    const timestamps = new Set(bucket.map((input) => input.atMs).filter((value): value is number => value !== null));
+    const kinds = new Set(bucket.map((input) => input.kind));
+    if (timestamps.size > 1 || kinds.size > 1) {
+      selected.kind = "unknown";
+      selected.quality = "partial";
+      selected.reasons = ["input-kind-unknown"];
+      inputReasons.add("input-kind-unknown");
+      inputReasons.add("input-history-incomplete");
+    }
+    currentInputs.push(selected);
+  }
+  const currentUnknownOrigins = new Set(currentInputs
+    .filter((record) => record.kind === "unknown")
+    .map((record) => record.originKey));
+  const inputs = mergeInputRecords(
+    currentInputs,
+    retainedInputRecords(context.store, currentInputs.map((record) => record.originKey)),
+  ).map((record) => currentUnknownOrigins.has(record.originKey)
+    ? {
+        ...record,
+        kind: "unknown" as const,
+        quality: "partial" as const,
+        reasons: [...new Set([...record.reasons, "input-kind-unknown"])].sort(),
+      }
+    : record);
+  const supportedInputDatabases = projections.filter((projection) => projection.inputSupported).length;
+  const certifiedInputs = inputs.filter((input) => input.kind === "submission").length;
+  const ambiguousInputs = inputs.filter((input) => input.kind === "unknown").length;
+  const priorInputState = context.store.getInputSourceState(SOURCE_KEY);
+  const previousSuccessfulScan = typeof priorInputState?.last_successful_scan_ms === "number"
+    ? priorInputState.last_successful_scan_ms
+    : null;
+  const inputQuality: Quality = supportedInputDatabases === 0 || (certifiedInputs === 0 && ambiguousInputs > 0)
+    ? "unavailable"
+    : inputReasons.size > 0 ? "partial" : "recorded";
+  const inputSourceState = {
+    sourceKey: SOURCE_KEY,
+    agent: "hermes" as const,
+    parserVersion: 1 as const,
+    quality: inputQuality,
+    reasons: paths.length === 0
+      ? ["missing-source"]
+      : [...inputReasons].sort(),
+    scannedAtMs: context.cutoffMs,
+    lastSuccessfulScanMs: supportedInputDatabases > 0 ? context.cutoffMs : previousSuccessfulScan,
+  };
 
   const copies = selectMigratedCopies(projections.flatMap((projection) => projection.sessions));
   const sessions: SessionRecord[] = [];
@@ -847,6 +1033,8 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
     sessions,
     usage,
     workIntervals: [],
+    inputs,
+    inputSourceState,
     counterSnapshots,
     fileCursors: [],
     unallocatedUsageRecords,

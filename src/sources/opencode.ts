@@ -4,7 +4,8 @@ import { homedir } from "node:os";
 import { join, normalize } from "node:path";
 import { Database } from "bun:sqlite";
 import type { Config } from "../config";
-import type { Quality, UsageRecord, WorkInterval } from "../contracts";
+import type { InputRecord, Quality, UsageRecord, WorkInterval } from "../contracts";
+import { mergeInputRecords, retainedInputRecords, storedInputReasons, storedInputRecord } from "../inputs";
 import type { CounterSnapshot, SessionRecord, SourceRecord } from "../store";
 import type { AdapterBatch, AdapterContext, DiscoveryEntry, SourceAdapter } from "./types";
 
@@ -51,6 +52,7 @@ interface MessageRow {
   completed: number | null;
   tokens_json: string | null;
   cost: number | null;
+  data_json: string;
   finish: string | null;
 }
 
@@ -104,6 +106,7 @@ interface CandidateMessage {
   session: SourceSessionRow;
   sourceHash: string;
   parts: PartRow[];
+  input: InputRecord | null;
   normalized: NormalizedOpenCodeMessage | null;
   fingerprint: string;
 }
@@ -584,7 +587,7 @@ async function discover(config?: Config): Promise<DiscoveryEntry[]> {
 }
 
 const MESSAGE_PROJECTION = `
-  SELECT id, session_id, time_created, time_updated,
+  SELECT id, session_id, time_created, time_updated, data AS data_json,
     json_extract(data, '$.role') AS role,
     json_extract(data, '$.providerID') AS provider,
     json_extract(data, '$.modelID') AS model,
@@ -613,14 +616,6 @@ function readMessagesKeyset(database: Database, sessionId: string, lowerBound: n
   return rows;
 }
 
-function readMessagesById(database: Database, sessionId: string, ids: string[]): MessageRow[] {
-  const rows: MessageRow[] = [];
-  for (const id of ids) {
-    const row = database.query(`${MESSAGE_PROJECTION} WHERE session_id = ? AND id = ?`).get(sessionId, id) as MessageRow | null;
-    if (row !== null) rows.push(row);
-  }
-  return rows;
-}
 
 function readParts(database: Database, messageId: string): PartRow[] {
   const rows: PartRow[] = [];
@@ -669,15 +664,69 @@ function rawMessageFingerprint(row: MessageRow, parts: PartRow[]): string {
   });
 }
 
+function normalizeOpenCodeInput(
+  row: MessageRow,
+  session: SourceSessionRow,
+  sourceHash: string,
+  parts: PartRow[],
+): InputRecord | null {
+  if (row.role !== "user") return null;
+  const messageData = parseObject(row.data_json);
+  const messageKeys = messageData === null ? [] : Object.keys(messageData).sort();
+  const expectedMessageKeys = ["agent", "model", "role", "summary", "time"];
+  const ordinaryMessage = messageKeys.length === expectedMessageKeys.length
+    && messageKeys.every((key, index) => key === expectedMessageKeys[index])
+    && messageData?.role === "user";
+  const ordinaryParts = parts.length > 0 && parts.every((part) => {
+    const data = parsePartData({
+      id: part.id,
+      timeCreated: part.time_created,
+      timeUpdated: part.time_updated,
+      data: part.data,
+    });
+    if (data === null) return false;
+    const keys = Object.keys(data).sort();
+    return keys.length === 2
+      && keys[0] === "text"
+      && keys[1] === "type"
+      && data.type === "text"
+      && typeof data.text === "string"
+      && data.text.length > 0;
+  });
+  const kind: InputRecord["kind"] = ordinaryMessage && ordinaryParts ? "submission" : "unknown";
+  const sessionKey = `${sourceHash}:${session.id}`;
+  return {
+    originKey: `opencode:input:${stableHash([sourceHash, row.id])}`,
+    sourceKey: SOURCE_KEY,
+    agent: AGENT,
+    sessionKey,
+    nativeSessionId: session.id,
+    nativeInputId: row.id,
+    workspaceKey: session.directory === null || session.directory.length === 0
+      ? `opencode:unattributed:${stableHash([sourceHash, session.id])}`
+      : normalize(session.directory),
+    repositoryKey: null,
+    atMs: safeTimestamp(row.time_created),
+    kind,
+    lane: session.parent_id === null ? "main" : "unknown",
+    controller: null,
+    origin: "unknown",
+    originEvidence: "none",
+    quality: kind === "unknown" ? "partial" : "recorded",
+    reasons: kind === "unknown" ? ["input-kind-unknown"] : [],
+  };
+}
+
 function makeCandidate(
   row: MessageRow,
   session: SourceSessionRow,
   sourceHash: string,
   parts: PartRow[],
+  includeAccounting: boolean,
   fingerprintOverride?: string,
 ): CandidateMessage {
   const workspaceKey = session.directory === null || session.directory.length === 0 ? "unattributed" : normalize(session.directory);
-  const normalized = row.role === "assistant"
+  const normalized = row.role === "assistant" && includeAccounting
     ? normalizeOpenCodeMessage({
         id: row.id,
         sessionId: `${sourceHash}:${session.id}`,
@@ -695,12 +744,14 @@ function makeCandidate(
         parts: parts.map((part) => ({ id: part.id, timeCreated: part.time_created, timeUpdated: part.time_updated, data: part.data })),
       })
     : null;
+  const input = normalizeOpenCodeInput(row, session, sourceHash, parts);
   return {
     row,
     session,
     sourceHash,
     parts,
     normalized,
+    input,
     fingerprint: fingerprintOverride ?? rawMessageFingerprint(row, parts),
   };
 }
@@ -724,15 +775,37 @@ function sessionOrder(left: SourceSessionRow, right: SourceSessionRow): number {
   return (safeTimestamp(left.time_created) ?? Number.MAX_SAFE_INTEGER) - (safeTimestamp(right.time_created) ?? Number.MAX_SAFE_INTEGER)
     || left.id.localeCompare(right.id);
 }
+function storedPrefixInput(
+  context: AdapterContext,
+  fingerprint: string,
+  sessionKey: string,
+): InputRecord | null {
+  const prefix = `input-clone-prefix:${fingerprint}:`;
+  const rows = context.store.database.query(`
+    SELECT counter_key FROM counter_snapshots
+    WHERE source_key = ? AND session_key = ? AND counter_key LIKE ?
+  `).all(SOURCE_KEY, sessionKey, `${prefix}%`) as Array<{ counter_key: string }>;
+  const records = rows
+    .map((row) => context.store.getInput(row.counter_key.slice(prefix.length)))
+    .filter((row): row is Record<string, unknown> => row !== null)
+    .map(storedInputRecord)
+    .filter((record): record is InputRecord => record !== null);
+  return records.length === 1 ? records[0]! : null;
+}
+
 
 function determineCloneOwners(scans: SessionScan[], context: AdapterContext): {
   ownerBySession: Map<string, string>;
   duplicateMessageKeys: Set<string>;
   ambiguousMessageKeys: Set<string>;
+  retainedReplayInputs: InputRecord[];
+  promotedPrefixFingerprints: Set<string>;
 } {
   const ownerBySession = new Map<string, string>();
   const duplicateMessageKeys = new Set<string>();
   const ambiguousMessageKeys = new Set<string>();
+  const retainedReplayInputs: InputRecord[] = [];
+  const promotedPrefixFingerprints = new Set<string>();
   const orderedScans = [...scans].sort((a, b) => sessionOrder(a.session, b.session));
 
   for (let i = 0; i < orderedScans.length; i += 1) {
@@ -753,7 +826,9 @@ function determineCloneOwners(scans: SessionScan[], context: AdapterContext): {
         ownerBySession.set(copyKey, ownerBySession.get(ownerKey) ?? ownerKey);
         for (let index = 0; index < common; index += 1) {
           const message = copy.messages[index];
-          if (message?.normalized !== null) duplicateMessageKeys.add(`${copyKey}:${message.row.id}`);
+          if (message && (message.normalized !== null || message.input !== null)) {
+            duplicateMessageKeys.add(`${copyKey}:${message.row.id}`);
+          }
         }
       }
     }
@@ -774,9 +849,35 @@ function determineCloneOwners(scans: SessionScan[], context: AdapterContext): {
       common += 1;
     }
     if (common >= 2 && hasAssistant && storedOwner !== null) {
-      ownerBySession.set(sessionKey, storedOwner);
-      for (const message of scan.messages.slice(0, common)) {
-        if (message.normalized !== null) duplicateMessageKeys.add(`${sessionKey}:${message.row.id}`);
+      const storedSession = context.store.database.query(`
+        SELECT started_at_ms FROM sessions WHERE agent = 'opencode' AND session_key = ?
+      `).get(storedOwner) as { started_at_ms: number | null } | null;
+      const currentStarted = safeTimestamp(scan.session.time_created);
+      const storedStarted = safeTimestamp(storedSession?.started_at_ms);
+      const currentIsOlder = storedSession !== null
+        && currentStarted !== null
+        && (storedStarted === null
+          || currentStarted < storedStarted
+          || (currentStarted === storedStarted && sessionKey.localeCompare(storedOwner) < 0));
+      if (currentIsOlder) {
+        ownerBySession.set(storedOwner, sessionKey);
+        for (const message of scan.messages.slice(0, common)) {
+          promotedPrefixFingerprints.add(message.fingerprint);
+          if (message.input === null) continue;
+          const retainedInput = storedPrefixInput(context, message.fingerprint, storedOwner);
+          if (retainedInput === null || retainedInput.kind === "context" || retainedInput.kind === "unknown") continue;
+          retainedReplayInputs.push({
+            ...retainedInput,
+            kind: "replay",
+            quality: "recorded",
+            reasons: [],
+          });
+        }
+      } else {
+        ownerBySession.set(sessionKey, storedOwner);
+        for (const message of scan.messages.slice(0, common)) {
+          if (message.normalized !== null || message.input !== null) duplicateMessageKeys.add(`${sessionKey}:${message.row.id}`);
+        }
       }
     }
   }
@@ -810,10 +911,16 @@ function determineCloneOwners(scans: SessionScan[], context: AdapterContext): {
       }
     }
   }
-  return { ownerBySession, duplicateMessageKeys, ambiguousMessageKeys };
+  return {
+    ownerBySession,
+    duplicateMessageKeys,
+    ambiguousMessageKeys,
+    retainedReplayInputs,
+    promotedPrefixFingerprints,
+  };
 }
 
-function collectDatabase(path: string, context: AdapterContext): {
+function collectDatabase(path: string, context: AdapterContext, forceInputHistory: boolean): {
   scans: SessionScan[];
   sessions: SessionRecord[];
   snapshots: CounterSnapshot[];
@@ -823,7 +930,10 @@ function collectDatabase(path: string, context: AdapterContext): {
   const scans: SessionScan[] = [];
   const sessions: SessionRecord[] = [];
   const snapshots: CounterSnapshot[] = [];
+  let transactionOpen = false;
   try {
+    database.exec("BEGIN");
+    transactionOpen = true;
     const sessionRows = database.query(`
       SELECT id, directory, parent_id, time_created, time_updated
       FROM session ORDER BY time_created, id
@@ -836,16 +946,12 @@ function collectDatabase(path: string, context: AdapterContext): {
       const priorMessageTime = context.rebuild ? null : safeTimestamp(baseline?.observed_at_ms);
       const priorSessionUpdate = context.rebuild ? null : safeTimestamp(baseline?.last_seen_ms);
       const sessionChanged = priorSessionUpdate === null || safeTimestamp(session.time_updated) !== priorSessionUpdate;
-      const shouldScan = context.rebuild || context.reconcileAll || baseline === null || sessionChanged;
-      let rows: MessageRow[] = [];
-      if (shouldScan) {
-        rows = readMessagesKeyset(database, session.id, context.rebuild || context.reconcileAll || baseline === null ? null : priorMessageTime);
-        if (!context.rebuild && !context.reconcileAll && baseline !== null) {
-          const incomplete = readIncompleteMessageIds(context, sessionKey);
-          rows.push(...readMessagesById(database, session.id, incomplete));
-        }
-      }
-      const fullHistory = context.rebuild || context.reconcileAll || baseline === null;
+      const shouldScan = context.rebuild || context.reconcileAll || forceInputHistory || baseline === null || sessionChanged;
+      const incompleteIds = !context.rebuild && !context.reconcileAll && baseline !== null
+        ? new Set(readIncompleteMessageIds(context, sessionKey))
+        : new Set<string>();
+      const rows = shouldScan ? readMessagesKeyset(database, session.id, null) : [];
+      const fullHistory = shouldScan;
       const uniqueRows = [...new Map(rows.map((row) => [row.id, row])).values()]
         .filter((row) => safeTimestamp(row.time_created) !== null && row.time_created <= context.cutoffMs)
         .sort((a, b) => a.time_created - b.time_created || a.id.localeCompare(b.id));
@@ -854,14 +960,24 @@ function collectDatabase(path: string, context: AdapterContext): {
         const existingUsage = row.role === "assistant"
           ? context.store.getUsage(`opencode:${sourceHash}:message:${row.id}`)
           : null;
-        const needsParts = priorState === null
+        const needsParts = row.role === "user"
+          || priorState === null
           || safeTimestamp(row.time_updated) !== priorState.observedAtMs
           || existingUsage?.quality === "partial";
+        const includeAccounting = context.rebuild
+          || context.reconcileAll
+          || priorMessageTime === null
+          || row.time_created >= priorMessageTime
+          || priorState === null
+          || safeTimestamp(row.time_updated) !== priorState.observedAtMs
+          || existingUsage?.quality === "partial"
+          || incompleteIds.has(row.id);
         const candidate = makeCandidate(
           row,
           session,
           sourceHash,
           needsParts ? readParts(database, row.id) : [],
+          includeAccounting,
           needsParts ? undefined : priorState.fingerprint,
         );
         snapshots.push({
@@ -903,6 +1019,17 @@ function collectDatabase(path: string, context: AdapterContext): {
         reasons: [],
       });
     }
+    database.exec("COMMIT");
+    transactionOpen = false;
+  } catch (error) {
+    if (transactionOpen) {
+      try {
+        database.exec("ROLLBACK");
+      } catch {
+        // Preserve the projection failure.
+      }
+    }
+    throw error;
   } finally {
     database.close();
   }
@@ -912,6 +1039,15 @@ function collectDatabase(path: string, context: AdapterContext): {
 async function collect(context: AdapterContext): Promise<AdapterBatch> {
   const selected = configuredPaths(context.config);
   const paths = expandSourcePaths(selected);
+  const priorInputState = context.store.getInputSourceState(SOURCE_KEY);
+  const forceInputHistory = context.rebuild
+    || context.reconcileAll
+    || priorInputState === null
+    || priorInputState.parser_version !== 1
+    || priorInputState.last_successful_scan_ms === null;
+  const previousSuccessfulScan = typeof priorInputState?.last_successful_scan_ms === "number"
+    ? priorInputState.last_successful_scan_ms
+    : null;
   const source: SourceRecord = {
     sourceKey: SOURCE_KEY,
     agent: AGENT,
@@ -932,6 +1068,16 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
       sessions: [],
       usage: [],
       workIntervals: [],
+      inputs: [],
+      inputSourceState: {
+        sourceKey: SOURCE_KEY,
+        agent: AGENT,
+        parserVersion: 1,
+        quality: "unavailable",
+        reasons: ["missing-source"],
+        scannedAtMs: context.cutoffMs,
+        lastSuccessfulScanMs: previousSuccessfulScan,
+      },
       counterSnapshots: [],
       fileCursors: [],
       unallocatedUsageRecords: 0,
@@ -944,6 +1090,7 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
   const counterSnapshots: CounterSnapshot[] = [];
   let unsupported = 0;
   let parseGaps = 0;
+  let projectedDatabases = 0;
   for (const path of paths) {
     const probe = probeOpenCodeDatabase(path);
     if (probe.state !== "available") {
@@ -951,16 +1098,23 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
       continue;
     }
     try {
-      const result = collectDatabase(path, context);
+      const result = collectDatabase(path, context, forceInputHistory);
       scans.push(...result.scans);
       sessions.push(...result.sessions);
       counterSnapshots.push(...result.snapshots);
+      projectedDatabases += 1;
     } catch {
       parseGaps += 1;
     }
   }
 
-  const { ownerBySession, duplicateMessageKeys, ambiguousMessageKeys } = determineCloneOwners(scans, context);
+  const {
+    ownerBySession,
+    duplicateMessageKeys,
+    ambiguousMessageKeys,
+    retainedReplayInputs,
+    promotedPrefixFingerprints,
+  } = determineCloneOwners(scans, context);
   const usage: UsageRecord[] = [];
   const workIntervals: WorkInterval[] = [];
   const emittedOrigins = new Set<string>();
@@ -993,6 +1147,50 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
       if (record !== undefined) record.canonicalSessionKey = canonicalSessionKey;
     }
   }
+  const currentInputs: InputRecord[] = [];
+  const inputReasons = new Set<string>();
+  for (const scan of scans) {
+    const sessionKey = `${scan.sourceHash}:${scan.session.id}`;
+    for (const message of scan.messages) {
+      if (message.input === null) continue;
+      const messageKey = `${sessionKey}:${message.row.id}`;
+      const input = { ...message.input, reasons: [...message.input.reasons] };
+      if (duplicateMessageKeys.has(messageKey)) {
+        input.kind = "replay";
+        input.quality = "recorded";
+        input.reasons = [];
+      } else {
+        const retained = context.store.getInput(input.originKey);
+        const retainedInput = retained === null ? null : storedInputRecord(retained);
+        if (retainedInput?.kind === "replay" && input.kind === "submission") {
+          input.kind = "replay";
+        }
+      }
+      if (input.kind === "unknown") inputReasons.add("input-kind-unknown");
+      currentInputs.push(input);
+    }
+  }
+  currentInputs.push(...retainedReplayInputs);
+  if (unsupported > 0 || parseGaps > 0) inputReasons.add("input-history-incomplete");
+  if (!forceInputHistory && priorInputState?.quality === "partial") {
+    for (const reason of storedInputReasons(priorInputState)) inputReasons.add(reason);
+  }
+  const inputs = mergeInputRecords(
+    currentInputs,
+    retainedInputRecords(context.store, currentInputs.map((record) => record.originKey)),
+  );
+  const inputQuality: Quality = projectedDatabases === 0
+    ? "unavailable"
+    : inputReasons.size > 0 ? "partial" : "recorded";
+  const inputSourceState = {
+    sourceKey: SOURCE_KEY,
+    agent: AGENT,
+    parserVersion: 1 as const,
+    quality: inputQuality,
+    reasons: [...inputReasons].sort(),
+    scannedAtMs: context.cutoffMs,
+    lastSuccessfulScanMs: projectedDatabases > 0 ? context.cutoffMs : previousSuccessfulScan,
+  };
 
   const reasons = new Set<string>();
   if (unsupported > 0) reasons.add("unsupported-schema");
@@ -1018,15 +1216,27 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
     const canonicalSessionKey = ownerBySession.get(sessionKey) ?? sessionKey;
     for (const message of scan.messages.slice(0, PREFIX_LIMIT)) {
       const key = `clone-prefix:${message.fingerprint}`;
-      if (context.store.getCounterSnapshot(SOURCE_KEY, key) !== null || prefixSnapshots.has(key)) continue;
-      prefixSnapshots.set(key, {
-        sourceKey: SOURCE_KEY,
-        counterKey: key,
-        sessionKey: canonicalSessionKey,
-        observedAtMs: message.row.time_created,
-        quality: "recorded",
-        reasons: [],
-      });
+      if (promotedPrefixFingerprints.has(message.fingerprint)
+        || (context.store.getCounterSnapshot(SOURCE_KEY, key) === null && !prefixSnapshots.has(key))) {
+        prefixSnapshots.set(key, {
+          sourceKey: SOURCE_KEY,
+          counterKey: key,
+          sessionKey: canonicalSessionKey,
+          observedAtMs: message.row.time_created,
+          quality: "recorded",
+          reasons: [],
+        });
+      }
+      if (message.input !== null && !duplicateMessageKeys.has(`${sessionKey}:${message.row.id}`)) {
+        counterSnapshots.push({
+          sourceKey: SOURCE_KEY,
+          counterKey: `input-clone-prefix:${message.fingerprint}:${message.input.originKey}`,
+          sessionKey,
+          observedAtMs: message.row.time_created,
+          quality: "recorded",
+          reasons: [],
+        });
+      }
     }
   }
   counterSnapshots.push(...prefixSnapshots.values());
@@ -1036,6 +1246,8 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
     sessions,
     usage,
     workIntervals,
+    inputs,
+    inputSourceState,
     counterSnapshots,
     fileCursors: [],
     unallocatedUsageRecords: 0,

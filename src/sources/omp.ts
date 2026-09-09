@@ -4,7 +4,8 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
 
 import type { Config } from "../config";
-import type { Quality, UsageRecord, WorkInterval } from "../contracts";
+import type { InputRecord, Quality, UsageRecord, WorkInterval } from "../contracts";
+import { mergeInputRecords, retainedInputRecords, storedInputReasons, storedInputRecord } from "../inputs";
 import type { FileCursor, SessionRecord, SourceRecord } from "../store";
 import type { AdapterBatch, AdapterContext, DiscoveryEntry, SourceAdapter } from "./types";
 import { scanJsonl, sourcePathKey } from "./jsonl";
@@ -67,6 +68,9 @@ export interface OmpNormalizationResult {
   sessions: SessionRecord[];
   usage: UsageRecord[];
   workIntervals: WorkInterval[];
+  inputs: InputRecord[];
+  inputQuality: Quality;
+  inputReasons: string[];
   diagnosticCounts: Record<string, number>;
   excludedAmbiguousRecords: number;
 }
@@ -446,7 +450,7 @@ export function normalizeOmpSessions(inputs: readonly OmpSessionInput[], cutoffM
     const record: SessionRecord = {
       agent: "omp",
       sessionKey: sessionKeys[index]!,
-      originKey: familyKeys[index]!,
+      originKey: `omp:native-session:${hashParts(session.header.id)}`,
       sourceKey: session.sourceKey,
       canonicalSessionKey: sessionKeys[canonicalByRoot.get(roots[index]!)!]!,
       parentSessionKey: parentIndexes[index] === null ? null : sessionKeys[parentIndexes[index]!]!,
@@ -464,6 +468,91 @@ export function normalizeOmpSessions(inputs: readonly OmpSessionInput[], cutoffM
       sessionIndexByKey.set(record.sessionKey, index);
     }
   });
+  const inputReasons = new Set<string>();
+  const inputCandidates: Array<InputRecord & { sessionIndex: number }> = [];
+  parsedSessions.forEach((session, sessionIndex) => {
+    const sessionKey = sessionKeys[sessionIndex]!;
+    const workspaceKey = session.header.cwd && isAbsolute(session.header.cwd)
+      ? normalize(session.header.cwd)
+      : `omp:unattributed:${hashParts(session.header.id)}`;
+    if (session.malformedRecords > 0 || session.incompleteTail || session.missingPrevious) {
+      inputReasons.add("input-history-incomplete");
+    }
+    for (const record of session.records) {
+      if (record.type !== "message") continue;
+      const message = nestedMessage(record);
+      if (message?.role !== "user") continue;
+      const nativeInputId = text(record.id);
+      if (nativeInputId === null) {
+        inputReasons.add("input-history-incomplete");
+        continue;
+      }
+      const atMs = timestampMs(message.timestamp) ?? timestampMs(record.timestamp);
+      if (atMs !== null && atMs > cutoffMs) continue;
+      const content = message.content;
+      const plainTextContent = Array.isArray(content)
+        && content.length > 0
+        && content.every((part) => {
+          const value = object(part);
+          return value?.type === "text" && typeof value.text === "string";
+        });
+      let kind: InputRecord["kind"] = message.attribution === "user" && plainTextContent
+        ? "submission"
+        : "unknown";
+      if (session.missingPrevious) {
+        kind = atMs !== null && session.header.timestampMs !== null && atMs < session.header.timestampMs
+          ? "replay"
+          : "unknown";
+      }
+      if (kind === "unknown") {
+        inputReasons.add("input-kind-unknown");
+        inputReasons.add("input-history-incomplete");
+      }
+      inputCandidates.push({
+        originKey: `omp:input:${hashParts(session.header.id, nativeInputId)}`,
+        sourceKey: session.sourceKey,
+        agent: "omp",
+        sessionKey,
+        nativeSessionId: session.header.id,
+        nativeInputId,
+        workspaceKey,
+        repositoryKey: null,
+        atMs,
+        kind,
+        lane: parentIndexes[sessionIndex] === null ? "main" : "subagent",
+        controller: null,
+        origin: "unknown",
+        originEvidence: "none",
+        quality: kind === "unknown" ? "partial" : "recorded",
+        reasons: kind === "unknown" ? ["input-kind-unknown"] : [],
+        sessionIndex,
+      });
+    }
+  });
+
+  const inputsByFamilyId = new Map<string, Array<InputRecord & { sessionIndex: number }>>();
+  for (const input of inputCandidates) {
+    const key = `${roots[input.sessionIndex]}\0${input.nativeInputId}`;
+    const bucket = inputsByFamilyId.get(key) ?? [];
+    bucket.push(input);
+    inputsByFamilyId.set(key, bucket);
+  }
+  for (const bucket of inputsByFamilyId.values()) {
+    if (bucket.length < 2) continue;
+    const canonical = bucket.find((input) => canonicalByRoot.get(roots[input.sessionIndex]!) === input.sessionIndex);
+    const owner = canonical ?? [...bucket].sort((left, right) =>
+      (left.atMs ?? Number.MAX_SAFE_INTEGER) - (right.atMs ?? Number.MAX_SAFE_INTEGER)
+      || left.sessionKey.localeCompare(right.sessionKey))[0]!;
+    if (owner.kind !== "unknown") owner.kind = "submission";
+    for (const input of bucket) {
+      if (input !== owner) {
+        input.kind = "replay";
+        input.quality = "recorded";
+        input.reasons = [];
+      }
+    }
+  }
+  const normalizedInputs = mergeInputRecords(inputCandidates.map(({ sessionIndex: _, ...input }) => input));
 
   const candidates = new Map<string, UsageCandidate[]>();
   parsedSessions.forEach((session, sessionIndex) => {
@@ -614,6 +703,9 @@ export function normalizeOmpSessions(inputs: readonly OmpSessionInput[], cutoffM
     sessions: [...sessionsByKey.values()].sort((left, right) => left.sessionKey.localeCompare(right.sessionKey)),
     usage,
     workIntervals,
+    inputs: normalizedInputs,
+    inputQuality: inputReasons.size === 0 ? "recorded" : "partial",
+    inputReasons: [...inputReasons].sort(),
     diagnosticCounts: diagnostics,
     excludedAmbiguousRecords,
   };
@@ -762,6 +854,15 @@ async function discover(config?: Config): Promise<DiscoveryEntry[]> {
 async function collect(context: AdapterContext): Promise<AdapterBatch> {
   const discovered = await discover(context.config);
   const discovery = discovered[0]!;
+  const priorInputState = context.store.getInputSourceState(OMP_SOURCE_KEY);
+  const forceInputBackfill = context.rebuild
+    || context.reconcileAll
+    || priorInputState === null
+    || priorInputState.parser_version !== 1
+    || priorInputState.last_successful_scan_ms === null;
+  const previousSuccessfulScan = typeof priorInputState?.last_successful_scan_ms === "number"
+    ? priorInputState.last_successful_scan_ms
+    : null;
   const sourceBase: SourceRecord = {
     sourceKey: OMP_SOURCE_KEY,
     agent: "omp",
@@ -783,6 +884,16 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
       sessions: [],
       usage: [],
       workIntervals: [],
+      inputs: [],
+      inputSourceState: {
+        sourceKey: OMP_SOURCE_KEY,
+        agent: "omp",
+        parserVersion: 1,
+        quality: "unavailable",
+        reasons: discovery.reasons.includes("unsupported-schema") ? ["input-history-incomplete"] : ["missing-source"],
+        scannedAtMs: context.cutoffMs,
+        lastSuccessfulScanMs: previousSuccessfulScan,
+      },
       counterSnapshots: [],
       fileCursors: [],
       unallocatedUsageRecords: 0,
@@ -790,10 +901,15 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
     };
   }
 
-  const inputs: OmpSessionInput[] = [];
+  const sessionInputs: OmpSessionInput[] = [];
   const fileCursors: FileCursor[] = [];
   let unsupported = 0;
   let scanFailures = 0;
+  const newlyDiscoveredFamily = discovery.paths.some((path) => {
+    const pathKey = sourcePathKey(OMP_SOURCE_KEY, path);
+    return context.store.getFileCursor(OMP_SOURCE_KEY, pathKey) === null;
+  });
+  const reconcileInputFamilies = forceInputBackfill || newlyDiscoveredFamily;
   for (const path of discovery.paths) {
     const header = await readHeader(path);
     if (!header.supported) {
@@ -808,13 +924,13 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
         sourceKey: OMP_SOURCE_KEY,
         pathKey,
         path,
-        previousCursor: context.rebuild ? null : context.store.getFileCursor(OMP_SOURCE_KEY, pathKey),
+        previousCursor: reconcileInputFamilies ? null : context.store.getFileCursor(OMP_SOURCE_KEY, pathKey),
         onRecord(record) {
           const parsed = object(record);
           if (parsed) records.push(parsed);
         },
       });
-      inputs.push({
+      sessionInputs.push({
         path,
         sourceKey: OMP_SOURCE_KEY,
         records,
@@ -826,7 +942,75 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
       scanFailures += 1;
     }
   }
-  const normalized = normalizeOmpSessions(inputs, context.cutoffMs);
+  const normalized = normalizeOmpSessions(sessionInputs, context.cutoffMs);
+  const familyBySession = new Map(normalized.sessions.map((session) => [
+    session.sessionKey,
+    session.canonicalSessionKey ?? session.sessionKey,
+  ]));
+  const familySessions = new Map<string, Set<string>>();
+  for (const [sessionKey, family] of familyBySession) {
+    const members = familySessions.get(family) ?? new Set<string>();
+    members.add(sessionKey);
+    familySessions.set(family, members);
+  }
+  const currentByFamilyInput = new Map<string, InputRecord[]>();
+  for (const input of normalized.inputs) {
+    const family = familyBySession.get(input.sessionKey) ?? input.sessionKey;
+    const key = `${family}\0${input.nativeInputId}`;
+    const bucket = currentByFamilyInput.get(key) ?? [];
+    bucket.push(input);
+    currentByFamilyInput.set(key, bucket);
+  }
+  for (const bucket of currentByFamilyInput.values()) {
+    const family = familyBySession.get(bucket[0]!.sessionKey) ?? bucket[0]!.sessionKey;
+    const members = familySessions.get(family) ?? new Set([bucket[0]!.sessionKey]);
+    const retainedRows = context.store.database.query(
+      "SELECT * FROM input_events WHERE agent = 'omp' AND native_input_id = ?",
+    ).all(bucket[0]!.nativeInputId) as Array<Record<string, unknown>>;
+    const retainedOwner = retainedRows
+      .map(storedInputRecord)
+      .filter((record): record is InputRecord => record !== null)
+      .find((record) => members.has(record.sessionKey) && record.kind === "submission");
+    if (retainedOwner === undefined) continue;
+    for (const input of bucket) {
+      if (input.sessionKey === retainedOwner.sessionKey && input.nativeSessionId === retainedOwner.nativeSessionId) {
+        if (input.kind !== "unknown" && input.kind !== "context") input.kind = "submission";
+      } else if (input.kind === "submission" || input.kind === "replay") {
+        input.kind = "replay";
+      }
+    }
+  }
+  for (const input of normalized.inputs) {
+    if (input.kind !== "submission") continue;
+    const retained = context.store.getInput(input.originKey);
+    const retainedInput = retained === null ? null : storedInputRecord(retained);
+    if (retainedInput?.kind === "replay") {
+      input.kind = "replay";
+      input.quality = "recorded";
+      input.reasons = [];
+    }
+  }
+  const normalizedInputs = mergeInputRecords(
+    normalized.inputs,
+    retainedInputRecords(context.store, normalized.inputs.map((record) => record.originKey)),
+  );
+  const inputReasons = new Set(normalized.inputReasons);
+  if (unsupported > 0 || scanFailures > 0) inputReasons.add("input-history-incomplete");
+  if (!reconcileInputFamilies && priorInputState?.quality === "partial") {
+    for (const reason of storedInputReasons(priorInputState)) inputReasons.add(reason);
+  }
+  const inputQuality: Quality = fileCursors.length === 0
+    ? "unavailable"
+    : inputReasons.size > 0 ? "partial" : "recorded";
+  const inputSourceState = {
+    sourceKey: OMP_SOURCE_KEY,
+    agent: "omp" as const,
+    parserVersion: 1 as const,
+    quality: inputQuality,
+    reasons: [...inputReasons].sort(),
+    scannedAtMs: context.cutoffMs,
+    lastSuccessfulScanMs: fileCursors.length > 0 ? context.cutoffMs : previousSuccessfulScan,
+  };
   const diagnosticCounts: Record<string, number> = { ...discovery.diagnosticCounts };
   if (unsupported > 0) {
     diagnosticCounts["unsupported-schema"] = Math.max(diagnosticCounts["unsupported-schema"] ?? 0, unsupported);
@@ -858,6 +1042,8 @@ async function collect(context: AdapterContext): Promise<AdapterBatch> {
     sessions: normalized.sessions,
     usage: normalized.usage,
     workIntervals: normalized.workIntervals,
+    inputs: normalizedInputs,
+    inputSourceState,
     counterSnapshots: [],
     fileCursors,
     unallocatedUsageRecords: 0,

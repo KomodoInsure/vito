@@ -4,7 +4,8 @@ import { homedir } from "node:os";
 import { basename, extname, isAbsolute, join, normalize, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import type { Config } from "../config";
-import type { Quality, UsageRecord, WorkInterval } from "../contracts";
+import type { InputRecord, Quality, UsageRecord, WorkInterval } from "../contracts";
+import { mergeInputRecords, retainedInputRecords, storedInputReasons } from "../inputs";
 import type { CounterSnapshot, FileCursor, SessionRecord, SourceRecord } from "../store";
 import { scanJsonl, sourcePathKey } from "./jsonl";
 import type { AdapterBatch, AdapterContext, DiscoveryEntry, SourceAdapter } from "./types";
@@ -47,6 +48,9 @@ export interface CodexNormalizationResult {
   sessions: SessionRecord[];
   usage: UsageRecord[];
   workIntervals: WorkInterval[];
+  inputs: InputRecord[];
+  inputQuality: Quality;
+  inputReasons: string[];
   counterSnapshots: CounterSnapshot[];
   diagnosticCounts: Record<string, number>;
   reasons: string[];
@@ -82,6 +86,7 @@ interface ContextState {
   workspaceKey: string | null;
   provider: string;
   model: string;
+  controller: string | null;
   turnKey: string | null;
   startedAtMs: number | null;
   endedAtMs: number | null;
@@ -253,9 +258,13 @@ class CodexNormalizer {
   readonly usage = new Map<string, UsageRecord>();
   readonly workIntervals = new Map<string, WorkInterval>();
   readonly counterSnapshots: CounterSnapshot[] = [];
+  readonly inputs: InputRecord[] = [];
   readonly diagnosticCounts: Record<string, number> = {};
   readonly reasons = new Set<string>();
   unallocatedUsageRecords = 0;
+  private readonly inputReasons = new Set<string>();
+  private sawVerifiedInput = false;
+  private sawUnsupportedInputProjection = false;
 
   private readonly state: ContextState;
 
@@ -271,6 +280,7 @@ class CodexNormalizer {
       workspaceKey: null,
       provider: UNKNOWN,
       model: UNKNOWN,
+      controller: null,
       turnKey: null,
       sessionByRolloutPath: options.sessionByRolloutPath ?? new Map(),
       startedAtMs: null,
@@ -316,6 +326,14 @@ class CodexNormalizer {
       this.parseGap("unsupported-schema");
       return;
     }
+    if (type === "response_item" && payload.type === "message" && payload.role === "user") {
+      this.acceptInput(payload, atMs);
+      return;
+    }
+    if (type === "event_msg" && payload.type === "user_message") {
+      this.sawUnsupportedInputProjection = true;
+      return;
+    }
     if (type === "turn_context") {
       this.state.model = stringValue(payload.model) ?? UNKNOWN;
       this.state.turnKey = stringValue(payload.turn_id) ?? stringValue(record.turn_id);
@@ -331,6 +349,8 @@ class CodexNormalizer {
       return;
     }
     if (type === "event_msg" && payload.type === "item_completed") {
+      const item = object(payload.item);
+      if (normalizedItemType(item?.type) === "usermessage") this.sawUnsupportedInputProjection = true;
       this.acceptTimedItem(record, payload);
     }
   }
@@ -350,7 +370,7 @@ class CodexNormalizer {
       this.sessions.push({
         agent: AGENT,
         sessionKey: state.sessionKey,
-        originKey: `codex:session:${hash(state.canonicalSessionKey ?? state.sessionKey)}`,
+        originKey: `codex:native-session:${hash(state.sessionKey)}`,
         sourceKey: state.sourceKey,
         canonicalSessionKey: state.canonicalSessionKey ?? state.sessionKey,
         parentSessionKey: state.parentSessionKey,
@@ -381,11 +401,18 @@ class CodexNormalizer {
         reasons: [...this.reasons].filter((reason) => reason === "counter-discontinuity" || reason === "unallocated-history"),
       });
     }
+    if (this.sawUnsupportedInputProjection && !this.sawVerifiedInput) {
+      this.inputReasons.add("input-history-incomplete");
+    }
+    const mergedInputs = mergeInputRecords(this.inputs);
     return {
       sessions: this.sessions,
       usage: [...this.usage.values()],
       workIntervals: [...this.workIntervals.values()],
       counterSnapshots: this.counterSnapshots,
+      inputs: mergedInputs,
+      inputQuality: this.inputReasons.size === 0 ? "recorded" : "partial",
+      inputReasons: [...this.inputReasons].sort(),
       diagnosticCounts: this.diagnosticCounts,
       reasons: [...this.reasons].sort(),
       unallocatedUsageRecords: this.unallocatedUsageRecords,
@@ -408,6 +435,8 @@ class CodexNormalizer {
     this.state.sessionKey = sessionKey;
     this.state.workspaceKey = stringValue(payload.cwd);
     this.state.provider = stringValue(payload.model_provider) ?? UNKNOWN;
+    const originator = stringValue(payload.originator);
+    this.state.controller = originator !== null && originator.length <= 128 ? originator : null;
     this.state.parentSessionKey = this.state.parentBySession.get(sessionKey) ?? null;
     const previous: unknown[] = Array.isArray(payload.previousSessionFiles)
       ? payload.previousSessionFiles
@@ -424,6 +453,53 @@ class CodexNormalizer {
       previousOriginal ??
       sessionKey;
     this.state.startedAtMs = atMs ?? instantMs(payload.timestamp) ?? this.state.startedAtMs;
+  }
+
+  private acceptInput(payload: UnknownRecord, atMs: number | null): void {
+    if (!this.state.sessionKey) return;
+    const nativeInputId = stringValue(payload.id);
+    if (nativeInputId === null) {
+      this.sawUnsupportedInputProjection = true;
+      this.inputReasons.add("input-history-incomplete");
+      return;
+    }
+    this.sawVerifiedInput = true;
+    const metadata = object(payload.internal_chat_message_metadata_passthrough);
+    const rawKinds = metadata?.content_item_kinds;
+    const kinds = Array.isArray(rawKinds)
+      ? rawKinds.filter((kind): kind is string => typeof kind === "string")
+      : [];
+    const contextKinds: Record<string, true> = {
+      "plugins.recommendations": true,
+      "agents_md.instructions": true,
+      "environments.environment_context": true,
+      "skills.selected_skill_instructions": true,
+    };
+    let kind: InputRecord["kind"] = "unknown";
+    if (kinds.includes("user.text")) kind = "submission";
+    else if (kinds.length > 0 && kinds.length === (rawKinds as unknown[]).length && kinds.every((value) => contextKinds[value])) {
+      kind = "context";
+    }
+    const reasons = kind === "unknown" ? ["input-kind-unknown"] : [];
+    if (kind === "unknown") this.inputReasons.add("input-kind-unknown");
+    this.inputs.push({
+      originKey: `codex:input:${hash(nativeInputId)}`,
+      sourceKey: this.state.sourceKey,
+      agent: AGENT,
+      sessionKey: this.state.sessionKey,
+      nativeSessionId: this.state.sessionKey,
+      nativeInputId,
+      workspaceKey: this.state.workspaceKey ?? `codex:unattributed:${hash(this.state.sessionKey)}`,
+      repositoryKey: null,
+      atMs,
+      kind,
+      lane: this.state.parentSessionKey === null ? "main" : "subagent",
+      controller: this.state.controller,
+      origin: "unknown",
+      originEvidence: "none",
+      quality: kind === "unknown" ? "partial" : "recorded",
+      reasons,
+    });
   }
 
   private acceptModern(record: UnknownRecord, payload: UnknownRecord, atMs: number | null): void {
@@ -926,6 +1002,15 @@ export const codexAdapter: SourceAdapter = {
     const snapshots: CounterSnapshot[] = [];
     const cursors: FileCursor[] = [];
     const reasons = new Set(discovery.reasons);
+    const currentInputs: InputRecord[] = [];
+    const inputReasons = new Set<string>();
+    const priorInputState = context.store.getInputSourceState("codex");
+    const forceInputBackfill = context.rebuild
+      || context.reconcileAll
+      || priorInputState === null
+      || priorInputState.parser_version !== 1
+      || priorInputState.last_successful_scan_ms === null;
+    let successfulInputScans = 0;
     let unallocatedUsageRecords = 0;
 
     for (const path of inventory.jsonl) {
@@ -940,8 +1025,9 @@ export const codexAdapter: SourceAdapter = {
       });
       try {
         const pathKey = sourcePathKey(sourceKey, resolve(path));
-        const previousCursor =
-          context.rebuild || context.reconcileAll ? null : context.store.getFileCursor(sourceKey, pathKey);
+        const previousCursor = context.rebuild || context.reconcileAll || forceInputBackfill
+          ? null
+          : context.store.getFileCursor(sourceKey, pathKey);
         let normalizer = makeNormalizer();
         let scan = await scanJsonl({
           sourceKey,
@@ -964,6 +1050,9 @@ export const codexAdapter: SourceAdapter = {
         cursors.push(scan.cursor);
         mergeCounts(diagnostics, result.diagnosticCounts);
         for (const reason of result.reasons) reasons.add(reason);
+        for (const reason of result.inputReasons) inputReasons.add(reason);
+        currentInputs.push(...result.inputs);
+        successfulInputScans += 1;
         if (result.usage.length > 0 && result.workIntervals.length === 0) {
           increment(diagnostics, "timing-unavailable");
           reasons.add("timing-unavailable");
@@ -971,11 +1060,13 @@ export const codexAdapter: SourceAdapter = {
         if (scan.diagnostics.parseGaps > 0) {
           diagnostics["parse-gap"] = (diagnostics["parse-gap"] ?? 0) + scan.diagnostics.parseGaps;
           reasons.add("parse-gap");
+          inputReasons.add("input-history-incomplete");
         }
         if (scan.diagnostics.unsupportedSchema > 0) {
           diagnostics["unsupported-schema"] =
             (diagnostics["unsupported-schema"] ?? 0) + scan.diagnostics.unsupportedSchema;
           reasons.add("unsupported-schema");
+          inputReasons.add("input-history-incomplete");
         }
         unallocatedUsageRecords += result.unallocatedUsageRecords;
         for (const session of result.sessions) sessions.set(session.sessionKey, session);
@@ -1010,8 +1101,35 @@ export const codexAdapter: SourceAdapter = {
       } catch {
         increment(diagnostics, "parse-gap");
         reasons.add("parse-gap");
+        inputReasons.add("input-history-incomplete");
       }
     }
+    if (successfulInputScans === 0) {
+      inputReasons.add(inventory.jsonl.length === 0 ? "missing-source" : "input-history-incomplete");
+    }
+    if (!forceInputBackfill && priorInputState?.quality === "partial") {
+      for (const reason of storedInputReasons(priorInputState)) inputReasons.add(reason);
+    }
+    const inputs = mergeInputRecords(
+      currentInputs,
+      retainedInputRecords(context.store, currentInputs.map((record) => record.originKey)),
+    );
+    if (inputs.some((input) => input.kind === "unknown")) inputReasons.add("input-kind-unknown");
+    const previousSuccessfulScan = typeof priorInputState?.last_successful_scan_ms === "number"
+      ? priorInputState.last_successful_scan_ms
+      : null;
+    const inputQuality: Quality = successfulInputScans === 0
+      ? "unavailable"
+      : inputReasons.size > 0 ? "partial" : "recorded";
+    const inputSourceState = {
+      sourceKey: "codex",
+      agent: AGENT,
+      parserVersion: 1 as const,
+      quality: inputQuality,
+      reasons: [...inputReasons].sort(),
+      scannedAtMs: context.cutoffMs,
+      lastSuccessfulScanMs: successfulInputScans > 0 ? context.cutoffMs : previousSuccessfulScan,
+    };
 
     const state = discovery.state === "available" && reasons.size > 0 ? "partial" : discovery.state;
     const tokenQuality: Quality = usage.size === 0
@@ -1046,6 +1164,8 @@ export const codexAdapter: SourceAdapter = {
       sessions: [...sessions.values()],
       usage: [...usage.values()],
       workIntervals: [...intervals.values()],
+      inputs,
+      inputSourceState,
       counterSnapshots: snapshots,
       fileCursors: cursors,
       unallocatedUsageRecords,

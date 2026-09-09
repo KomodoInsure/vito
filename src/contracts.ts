@@ -6,6 +6,46 @@ export type Agent = (typeof AGENTS)[number];
 export const QUALITIES = ["recorded", "partial", "unavailable"] as const;
 export type Quality = (typeof QUALITIES)[number];
 
+export type InputOrigin = "human" | "automated" | "unknown";
+
+export interface InputRecord {
+  originKey: string;
+  sourceKey: string;
+  agent: Agent;
+  sessionKey: string;
+  nativeSessionId: string;
+  nativeInputId: string;
+  workspaceKey: string;
+  repositoryKey: string | null;
+  atMs: number | null;
+  kind: "submission" | "context" | "replay" | "unknown";
+  lane: "main" | "subagent" | "unknown";
+  controller: string | null;
+  origin: InputOrigin;
+  originEvidence: "source" | "provenance" | "none" | "conflict";
+  quality: Quality;
+  reasons: string[];
+}
+
+export interface InputSourceState {
+  sourceKey: string;
+  agent: Agent;
+  parserVersion: 1;
+  quality: Quality;
+  reasons: string[];
+  scannedAtMs: number;
+  lastSuccessfulScanMs: number | null;
+}
+
+export interface InputProvenanceRecord {
+  originKey: string;
+  agent: Agent;
+  nativeSessionId: string;
+  nativeInputId: string;
+  origin: "human" | "automated";
+  controller: string | null;
+}
+
 export const PUBLIC_REASON_CODES = [
   "missing-source",
   "unsupported-schema",
@@ -21,6 +61,10 @@ export const PUBLIC_REASON_CODES = [
   "open-interval",
   "unattributed-session",
   "stale-ref",
+  "input-history-incomplete",
+  "input-kind-unknown",
+  "input-origin-conflict",
+  "input-origin-unknown",
 ] as const;
 export type PublicReasonCode = (typeof PUBLIC_REASON_CODES)[number];
 
@@ -179,6 +223,63 @@ const privateKeySchema = z.string().min(1);
 export const agentSchema = z.enum(AGENTS);
 export const qualitySchema = z.enum(QUALITIES);
 export const publicReasonCodeSchema = z.enum(PUBLIC_REASON_CODES);
+export const inputOriginSchema = z.enum(["human", "automated", "unknown"]);
+const controllerSchema = z.string().min(1).max(128).nullable();
+const inputReasonsSchema = z.array(publicReasonCodeSchema);
+
+export const inputRecordSchema: z.ZodType<InputRecord> = z
+  .object({
+    originKey: privateKeySchema,
+    sourceKey: privateKeySchema,
+    agent: agentSchema,
+    sessionKey: privateKeySchema,
+    nativeSessionId: privateKeySchema,
+    nativeInputId: privateKeySchema,
+    workspaceKey: privateKeySchema,
+    repositoryKey: privateKeySchema.nullable(),
+    atMs: nullableCounterSchema,
+    kind: z.enum(["submission", "context", "replay", "unknown"]),
+    lane: z.enum(["main", "subagent", "unknown"]),
+    controller: controllerSchema,
+    origin: inputOriginSchema,
+    originEvidence: z.enum(["source", "provenance", "none", "conflict"]),
+    quality: qualitySchema,
+    reasons: inputReasonsSchema,
+  })
+  .strict()
+  .superRefine((record, context) => {
+    const explicitEvidence = record.originEvidence === "source" || record.originEvidence === "provenance";
+    if ((explicitEvidence && record.origin === "unknown") || (!explicitEvidence && record.origin !== "unknown")) {
+      context.addIssue({
+        code: "custom",
+        message: "Input origin must agree with its evidence",
+        path: ["origin"],
+      });
+    }
+  });
+
+export const inputSourceStateSchema: z.ZodType<InputSourceState> = z
+  .object({
+    sourceKey: privateKeySchema,
+    agent: agentSchema,
+    parserVersion: z.literal(1),
+    quality: qualitySchema,
+    reasons: inputReasonsSchema,
+    scannedAtMs: nonnegativeSafeIntegerSchema,
+    lastSuccessfulScanMs: nullableCounterSchema,
+  })
+  .strict();
+
+export const inputProvenanceRecordSchema: z.ZodType<InputProvenanceRecord> = z
+  .object({
+    originKey: privateKeySchema,
+    agent: agentSchema,
+    nativeSessionId: privateKeySchema,
+    nativeInputId: privateKeySchema,
+    origin: z.enum(["human", "automated"]),
+    controller: controllerSchema,
+  })
+  .strict();
 
 export const usageRecordSchema: z.ZodType<UsageRecord> = z
   .object({

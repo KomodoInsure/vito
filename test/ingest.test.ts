@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import { spawnSync } from "node:child_process";
 import type { Config } from "../src/config";
-import type { UsageRecord } from "../src/contracts";
+import type { InputRecord, UsageRecord } from "../src/contracts";
 import {
   collectConfiguredActivity,
   collectIntoStore,
@@ -75,6 +75,27 @@ function fixtureUsage(originKey: string, sessionKey: string, workspaceKey: strin
   };
 }
 
+function fixtureInput(originKey: string, sessionKey: string, workspaceKey: string): InputRecord {
+  return {
+    originKey,
+    sourceKey: "codex:fixture",
+    agent: "codex",
+    sessionKey,
+    nativeSessionId: sessionKey,
+    nativeInputId: originKey,
+    workspaceKey,
+    repositoryKey: null,
+    atMs: 1_700_000_000_000,
+    kind: "submission",
+    lane: "main",
+    controller: null,
+    origin: "unknown",
+    originEvidence: "none",
+    quality: "recorded",
+    reasons: [],
+  };
+}
+
 function fixtureBatch(root: string): AdapterBatch {
   return {
     source: {
@@ -90,6 +111,16 @@ function fixtureBatch(root: string): AdapterBatch {
     sessions: [fixtureSession(root)],
     usage: [fixtureUsage("usage-one", "session-one", root)],
     workIntervals: [],
+    inputs: [fixtureInput("input-one", "session-one", root)],
+    inputSourceState: {
+      sourceKey: "codex:fixture",
+      agent: "codex",
+      parserVersion: 1,
+      quality: "recorded",
+      reasons: [],
+      scannedAtMs: 1_700_000_000_000,
+      lastSuccessfulScanMs: 1_700_000_000_000,
+    },
     counterSnapshots: [],
     fileCursors: [],
     unallocatedUsageRecords: 0,
@@ -249,12 +280,20 @@ describe("scope and orchestration", () => {
       fixtureUsage("historical", "historical", missingHistorical),
       fixtureUsage("inside", "parent", inside, 20),
     ];
+    batch.inputs = [
+      fixtureInput("input-inside", "parent", inside),
+      fixtureInput("input-child", "child", "unattributed-child"),
+      fixtureInput("input-outside", "outside", lookalike),
+      fixtureInput("input-orphan", "orphan", "unattributed-orphan"),
+    ];
 
     const scoped = filterAdapterBatch(batch, config);
     expect(scoped.sessions.filter((session) => session.scopeDecision === "included")
       .map((session) => session.sessionKey).sort()).toEqual(["child", "historical", "parent"]);
     expect(scoped.usage.filter((record) => record.scopeDecision === "included")
       .map((record) => record.originKey).sort()).toEqual(["child", "historical", "inside"]);
+    expect(scoped.inputs.filter((record) => record.scopeDecision === "included")
+      .map((record) => record.originKey).sort()).toEqual(["input-child", "input-inside"]);
     const insideUsage = scoped.usage.find((record) => record.originKey === "inside");
     const childUsage = scoped.usage.find((record) => record.originKey === "child");
     const historicalUsage = scoped.usage.find((record) => record.originKey === "historical");
@@ -382,6 +421,8 @@ describe("scope and orchestration", () => {
       expect(store.getUsage("usage-one")).toBeNull();
       expect(store.getCounterSnapshot("codex:fixture", "fixture-counter")).toBeNull();
       expect(store.database.query("SELECT * FROM sources WHERE source_key = ?").get("codex:fixture")).toBeNull();
+      expect(store.getInput("input-one")).toBeNull();
+      expect(store.getInputSourceState("codex:fixture")).toBeNull();
       expect((store.database.query("SELECT status FROM collection_runs").all() as Array<{ status: string }>).at(-1)?.status).toBe("failed");
     } finally {
       store.close();
@@ -396,8 +437,14 @@ describe("scope and orchestration", () => {
     const config = fixtureConfig(root, state);
     const store = CollectorStore.open(state);
     try {
+      const initial = fixtureBatch(root);
+      initial.inputSourceState = {
+        ...initial.inputSourceState,
+        quality: "partial",
+        reasons: ["input-kind-unknown"],
+      };
       await collectIntoStore(config, store, {
-        adapters: [adapterFor(fixtureBatch(root))],
+        adapters: [adapterFor(initial)],
         cutoffMs: Date.now(),
       });
       const missing = fixtureBatch(root);
@@ -409,6 +456,14 @@ describe("scope and orchestration", () => {
       };
       missing.sessions = [];
       missing.usage = [];
+      missing.inputs = [];
+      missing.inputSourceState = {
+        ...missing.inputSourceState,
+        quality: "unavailable",
+        reasons: ["missing-source"],
+        scannedAtMs: Date.now(),
+        lastSuccessfulScanMs: null,
+      };
       await collectIntoStore(config, store, {
         adapters: [adapterFor(missing)],
         cutoffMs: Date.now(),
@@ -419,6 +474,12 @@ describe("scope and orchestration", () => {
         throw new Error("Expected retained usage with a known total");
       }
       expect(retainedUsage.total).toBe(10);
+      expect(store.getInput("input-one")).not.toBeNull();
+      expect(store.getInputSourceState("codex:fixture")).toMatchObject({
+        quality: "unavailable",
+        last_successful_scan_ms: 1_700_000_000_000,
+        reasons_json: '["input-kind-unknown","missing-source"]',
+      });
       expect((store.database.query("SELECT state FROM sources WHERE source_key = ?").get("codex:fixture") as { state: string }).state).toBe("not-found");
     } finally {
       store.close();
@@ -455,6 +516,14 @@ describe("scope and orchestration", () => {
       };
       unavailable.sessions = [];
       unavailable.usage = [];
+      unavailable.inputs = [];
+      unavailable.inputSourceState = {
+        ...unavailable.inputSourceState,
+        quality: "unavailable",
+        reasons: ["missing-source"],
+        scannedAtMs: 200,
+        lastSuccessfulScanMs: 100,
+      };
       const contracted = { ...expanded, repositories: [] };
       await collectIntoStore(contracted, store, {
         adapters: [adapterFor(unavailable)],
@@ -469,6 +538,9 @@ describe("scope and orchestration", () => {
         "SELECT scope_decision AS decision FROM usage WHERE origin_key = ?",
       ).get("usage-one")).toEqual({ decision: "out-of-scope" });
       expect(store.database.query(
+        "SELECT scope_decision AS decision FROM input_events WHERE origin_key = ?",
+      ).get("input-one")).toEqual({ decision: "out-of-scope" });
+      expect(store.database.query(
         "SELECT decision, known_total AS total FROM scope_evidence WHERE origin_key = ?",
       ).get("usage-one")).toEqual({ decision: "out-of-scope", total: 10 });
       expect(store.database.query("SELECT COUNT(*) AS count FROM usage").get()).toEqual({ count: 1 });
@@ -481,6 +553,9 @@ describe("scope and orchestration", () => {
       expect(store.database.query(
         "SELECT scope_decision AS decision FROM usage WHERE origin_key = ?",
       ).get("usage-one")).toEqual({ decision: "included" });
+      expect(store.database.query(
+        "SELECT scope_decision AS decision FROM input_events WHERE origin_key = ?",
+      ).get("input-one")).toEqual({ decision: "included" });
       expect(store.database.query(
         "SELECT state, last_successful_scan_ms AS successful FROM sources WHERE source_key = ?",
       ).get("codex:fixture")).toEqual({ state: "not-found", successful: null });

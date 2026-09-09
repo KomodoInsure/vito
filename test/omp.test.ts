@@ -10,6 +10,7 @@ import {
   ompAdapter,
   type OmpSessionInput,
 } from "../src/sources/omp";
+import { CollectorStore } from "../src/store";
 
 const workspace = "/synthetic/company/project";
 const temporaryDirectories: string[] = [];
@@ -73,6 +74,26 @@ function assistant(
         totalTokens: options.total ?? input + output,
         cost: { total: options.cost ?? 0 },
       },
+    },
+  };
+}
+
+function user(
+  id: string,
+  at: string,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    type: "message",
+    id,
+    parentId: "parent",
+    timestamp: at,
+    message: {
+      role: "user",
+      content: [{ type: "text", text: "private input" }],
+      timestamp: Date.parse(at),
+      attribution: "user",
+      ...overrides,
     },
   };
 }
@@ -270,4 +291,99 @@ describe("OMP normalization", () => {
     expect(result.usage).toHaveLength(1);
     expect(result.usage[0]).toMatchObject({ cacheRead: null, quality: "partial", reasons: ["parse-gap"] });
   });
+  test("classifies ordinary and steering submissions and persists family replays", () => {
+    const originalPath = "/synthetic/sessions/project/2026-09-06T12-00-00_original.jsonl";
+    const forkPath = "/synthetic/sessions/project/2026-09-06T12-05-00_fork.jsonl";
+    const copied = user("shared-entry", "2026-09-06T12:00:01.000Z");
+    const result = normalizeOmpSessions([
+      {
+        path: originalPath,
+        records: [
+          header("original", "2026-09-06T12:00:00.000Z"),
+          copied,
+          user("ordinary", "2026-09-06T12:00:02.000Z"),
+          user("steering", "2026-09-06T12:00:03.000Z", { steering: true }),
+        ],
+      },
+      {
+        path: forkPath,
+        records: [
+          header("fork", "2026-09-06T12:05:00.000Z", { previousSessionFiles: [originalPath] }),
+          structuredClone(copied),
+          user("new-fork-input", "2026-09-06T12:05:01.000Z"),
+        ],
+      },
+    ]);
+
+    expect(result.inputs.filter((input) => input.kind === "submission")).toHaveLength(4);
+    expect(result.inputs.filter((input) => input.kind === "replay")).toHaveLength(1);
+    expect(result.inputs.find((input) => input.nativeSessionId === "fork" && input.nativeInputId === "shared-entry"))
+      .toMatchObject({ kind: "replay" });
+    expect(result.inputs.every((input) => input.origin === "unknown" && input.controller === null)).toBe(true);
+    expect(new Set(result.inputs.map((input) => input.originKey)).size).toBe(5);
+  });
+
+  test("marks unestablished attribution and missing-predecessor ambiguity without inventing submissions", () => {
+    const missing = "/synthetic/sessions/project/missing-original.jsonl";
+    const result = normalizeOmpSessions([{
+      path: "/synthetic/sessions/project/2026-09-06T12-05-00_copy.jsonl",
+      records: [
+        header("copy", "2026-09-06T12:05:00.000Z", { previousSessionFiles: [missing] }),
+        user("predating", "2026-09-06T12:00:00.000Z"),
+        user("ambiguous", "2026-09-06T12:06:00.000Z"),
+        user("unsupported-attribution", "2026-09-06T12:07:00.000Z", { attribution: "system" }),
+      ],
+    }]);
+    expect(Object.fromEntries(result.inputs.map((input) => [input.nativeInputId, input.kind]))).toEqual({
+      predating: "replay",
+      ambiguous: "unknown",
+      "unsupported-attribution": "unknown",
+    });
+    expect(result.inputQuality).toBe("partial");
+    expect(result.inputReasons).toContain("input-history-incomplete");
+  });
+
+  test("uses a unique native-session origin while retaining family metadata", () => {
+    const originalPath = "/synthetic/sessions/project/2026-09-06T12-00-00_original.jsonl";
+    const result = normalizeOmpSessions([
+      { path: originalPath, records: [header("original", "2026-09-06T12:00:00.000Z")] },
+      {
+        path: "/synthetic/sessions/project/2026-09-06T12-05-00_fork.jsonl",
+        records: [header("fork", "2026-09-06T12:05:00.000Z", { previousSessionFiles: [originalPath] })],
+      },
+    ]);
+    expect(result.sessions[0]?.originKey).not.toBe(result.sessions[1]?.originKey);
+    expect(new Set(result.sessions.map((session) => session.canonicalSessionKey)).size).toBe(1);
+  });
+
+  test("preserves a stored replay when its original file disappears", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "vito-omp-replay-")));
+    temporaryDirectories.push(root);
+    const project = join(root, "project");
+    const path = join(project, "2026-09-06T12-05-00_fork.jsonl");
+    const records = [
+      header("fork", "2026-09-06T12:05:00.000Z"),
+      user("shared-entry", "2026-09-06T12:05:01.000Z"),
+    ];
+    mkdirSync(project, { recursive: true });
+    writeFileSync(path, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+    const stateDir = join(root, "state");
+    const store = CollectorStore.open(stateDir);
+    try {
+      const retained = normalizeOmpSessions([{ path, records }]).inputs[0]!;
+      store.writeBatch({ inputs: [{ ...retained, kind: "replay" }] });
+      const config = { ...fixtureConfig([root]), stateDir };
+      const batch = await ompAdapter.collect({
+        config,
+        store,
+        rebuild: true,
+        cutoffMs: Date.parse("2026-09-07T00:00:00.000Z"),
+        reconcileAll: true,
+      });
+      expect(batch.inputs.find((input) => input.nativeInputId === "shared-entry")?.kind).toBe("replay");
+    } finally {
+      store.close();
+    }
+  });
+
 });

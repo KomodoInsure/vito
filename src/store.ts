@@ -1,10 +1,22 @@
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
-import type { Agent, Quality, UsageRecord, WorkInterval } from "./contracts";
+import {
+  inputProvenanceRecordSchema,
+  inputRecordSchema,
+  inputSourceStateSchema,
+  type Agent,
+  type InputProvenanceRecord,
+  type InputRecord,
+  type InputSourceState,
+  type Quality,
+  type UsageRecord,
+  type WorkInterval,
+} from "./contracts";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const DATABASE_FILENAME = "activity.sqlite";
 
 const schemaSql = `
@@ -192,6 +204,54 @@ CREATE TABLE IF NOT EXISTS scope_evidence (
   CHECK (known_total IS NULL OR known_total >= 0)
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS input_events (
+  origin_key TEXT PRIMARY KEY CHECK (length(origin_key) > 0),
+  source_key TEXT NOT NULL CHECK (length(source_key) > 0),
+  agent TEXT NOT NULL CHECK (agent IN ('codex','claude','omp','opencode','hermes')),
+  session_key TEXT NOT NULL CHECK (length(session_key) > 0),
+  native_session_id TEXT NOT NULL CHECK (length(native_session_id) > 0),
+  native_input_id TEXT NOT NULL CHECK (length(native_input_id) > 0),
+  workspace_key TEXT NOT NULL CHECK (length(workspace_key) > 0),
+  repository_key TEXT,
+  at_ms INTEGER,
+  kind TEXT NOT NULL CHECK (kind IN ('submission','context','replay','unknown')),
+  lane TEXT NOT NULL CHECK (lane IN ('main','subagent','unknown')),
+  controller TEXT CHECK (controller IS NULL OR (length(controller) BETWEEN 1 AND 128)),
+  origin TEXT NOT NULL CHECK (origin IN ('human','automated','unknown')),
+  origin_evidence TEXT NOT NULL CHECK (origin_evidence IN ('source','provenance','none','conflict')),
+  quality TEXT NOT NULL CHECK (quality IN ('recorded','partial','unavailable')),
+  reasons_json TEXT NOT NULL DEFAULT '[]',
+  scope_decision TEXT NOT NULL DEFAULT 'included' CHECK (scope_decision IN ('included','out-of-scope','unattributed')),
+  scope_reason TEXT NOT NULL DEFAULT 'configured-root' CHECK (length(scope_reason) > 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0),
+  CHECK (repository_key IS NULL OR length(repository_key) > 0),
+  CHECK (at_ms IS NULL OR at_ms >= 0),
+  CHECK (
+    (origin_evidence IN ('none','conflict') AND origin = 'unknown') OR
+    (origin_evidence IN ('source','provenance') AND origin IN ('human','automated'))
+  )
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS input_source_state (
+  source_key TEXT PRIMARY KEY CHECK (length(source_key) > 0),
+  agent TEXT NOT NULL CHECK (agent IN ('codex','claude','omp','opencode','hermes')),
+  parser_version INTEGER NOT NULL CHECK (parser_version = 1),
+  quality TEXT NOT NULL CHECK (quality IN ('recorded','partial','unavailable')),
+  reasons_json TEXT NOT NULL DEFAULT '[]',
+  scanned_at_ms INTEGER NOT NULL CHECK (scanned_at_ms >= 0),
+  last_successful_scan_ms INTEGER,
+  CHECK (last_successful_scan_ms IS NULL OR last_successful_scan_ms >= 0)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS input_provenance (
+  origin_key TEXT PRIMARY KEY CHECK (length(origin_key) > 0),
+  agent TEXT NOT NULL CHECK (agent IN ('codex','claude','omp','opencode','hermes')),
+  native_session_id TEXT NOT NULL CHECK (length(native_session_id) > 0),
+  native_input_id TEXT NOT NULL CHECK (length(native_input_id) > 0),
+  origin TEXT NOT NULL CHECK (origin IN ('human','automated')),
+  controller TEXT CHECK (controller IS NULL OR (length(controller) BETWEEN 1 AND 128))
+) STRICT;
+
 CREATE INDEX IF NOT EXISTS usage_at_model_idx ON usage(at_ms, provider, model);
 CREATE INDEX IF NOT EXISTS usage_agent_at_idx ON usage(agent, at_ms);
 CREATE INDEX IF NOT EXISTS usage_session_idx ON usage(agent, session_key);
@@ -209,6 +269,11 @@ CREATE INDEX IF NOT EXISTS commits_repository_time_idx ON commits(repository_key
 CREATE INDEX IF NOT EXISTS scope_evidence_at_idx ON scope_evidence(at_ms, agent, decision);
 CREATE INDEX IF NOT EXISTS scope_evidence_session_idx ON scope_evidence(agent, session_key);
 CREATE INDEX IF NOT EXISTS workspace_attributions_repository_idx ON workspace_attributions(repository_key);
+CREATE INDEX IF NOT EXISTS input_events_agent_at_idx ON input_events(agent, at_ms);
+CREATE INDEX IF NOT EXISTS input_events_session_idx ON input_events(agent, session_key);
+CREATE INDEX IF NOT EXISTS input_events_source_idx ON input_events(source_key);
+CREATE INDEX IF NOT EXISTS input_events_native_idx ON input_events(agent, native_session_id, native_input_id);
+CREATE INDEX IF NOT EXISTS input_provenance_native_idx ON input_provenance(agent, native_session_id, native_input_id);
 `;
 
 const migrateVersionOneSql = `
@@ -353,6 +418,9 @@ export interface LedgerBatch {
   sessions?: Array<SessionRecord & ScopeMembership>;
   usage?: Array<UsageRecord & ScopeMembership>;
   workIntervals?: Array<WorkInterval & ScopeMembership>;
+  inputs?: Array<InputRecord & ScopeMembership>;
+  inputSourceStates?: InputSourceState[];
+  inputProvenance?: InputProvenanceRecord[];
   counterSnapshots?: CounterSnapshot[];
   fileCursors?: FileCursor[];
   collectionRuns?: CollectionRun[];
@@ -533,6 +601,9 @@ export class CollectorStore {
       for (const session of batch.sessions ?? []) store.upsertSession(session);
       for (const record of batch.usage ?? []) store.upsertUsage(record);
       for (const interval of batch.workIntervals ?? []) store.upsertWorkInterval(interval);
+      for (const record of batch.inputs ?? []) store.upsertInput(record);
+      for (const state of batch.inputSourceStates ?? []) store.upsertInputSourceState(state);
+      for (const provenance of batch.inputProvenance ?? []) store.upsertInputProvenance(provenance);
       for (const snapshot of batch.counterSnapshots ?? []) store.upsertCounterSnapshot(snapshot);
       for (const cursor of batch.fileCursors ?? []) store.upsertFileCursor(cursor);
       for (const run of batch.collectionRuns ?? []) store.upsertCollectionRun(run);
@@ -601,6 +672,92 @@ export class CollectorStore {
       nullable(record.parentSessionKey), nullable(record.rootSessionKey), nullable(record.workspaceKey), nullable(record.repositoryKey),
       nullable(record.startedAtMs), nullable(record.endedAtMs), record.quality, normalizedReasons(record.reasons), updatedAtMs,
       scopeDecision, scopeReason,
+    );
+  }
+
+  upsertInput(record: InputRecord & ScopeMembership, updatedAtMs = Date.now()): void {
+    inputRecordSchema.parse({
+      originKey: record.originKey,
+      sourceKey: record.sourceKey,
+      agent: record.agent,
+      sessionKey: record.sessionKey,
+      nativeSessionId: record.nativeSessionId,
+      nativeInputId: record.nativeInputId,
+      workspaceKey: record.workspaceKey,
+      repositoryKey: record.repositoryKey,
+      atMs: record.atMs,
+      kind: record.kind,
+      lane: record.lane,
+      controller: record.controller,
+      origin: record.origin,
+      originEvidence: record.originEvidence,
+      quality: record.quality,
+      reasons: record.reasons,
+    });
+    requireNonnegativeInteger(updatedAtMs, "input.updatedAtMs");
+    const scopeDecision = record.scopeDecision ?? "included";
+    const scopeReason = record.scopeReason ?? "configured-root";
+    requireText(scopeReason, "input.scopeReason");
+    this.database.query(`
+      INSERT INTO input_events (
+        origin_key, source_key, agent, session_key, native_session_id, native_input_id,
+        workspace_key, repository_key, at_ms, kind, lane, controller, origin,
+        origin_evidence, quality, reasons_json, scope_decision, scope_reason, updated_at_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(origin_key) DO UPDATE SET
+        source_key=excluded.source_key, agent=excluded.agent, session_key=excluded.session_key,
+        native_session_id=excluded.native_session_id, native_input_id=excluded.native_input_id,
+        workspace_key=excluded.workspace_key, repository_key=excluded.repository_key,
+        at_ms=excluded.at_ms, kind=excluded.kind, lane=excluded.lane,
+        controller=excluded.controller, origin=excluded.origin, origin_evidence=excluded.origin_evidence,
+        quality=excluded.quality, reasons_json=excluded.reasons_json,
+        scope_decision=excluded.scope_decision, scope_reason=excluded.scope_reason,
+        updated_at_ms=excluded.updated_at_ms
+    `).run(
+      record.originKey, record.sourceKey, record.agent, record.sessionKey,
+      record.nativeSessionId, record.nativeInputId, record.workspaceKey, record.repositoryKey,
+      record.atMs, record.kind, record.lane, record.controller, record.origin,
+      record.originEvidence, record.quality, normalizedReasons(record.reasons),
+      scopeDecision, scopeReason, updatedAtMs,
+    );
+  }
+
+  upsertInputSourceState(record: InputSourceState): void {
+    inputSourceStateSchema.parse(record);
+    this.database.query(`
+      INSERT INTO input_source_state (
+        source_key, agent, parser_version, quality, reasons_json, scanned_at_ms, last_successful_scan_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(source_key) DO UPDATE SET
+        agent=excluded.agent, parser_version=excluded.parser_version, quality=excluded.quality,
+        reasons_json=excluded.reasons_json, scanned_at_ms=excluded.scanned_at_ms,
+        last_successful_scan_ms=excluded.last_successful_scan_ms
+    `).run(
+      record.sourceKey, record.agent, record.parserVersion, record.quality,
+      normalizedReasons(record.reasons), record.scannedAtMs, record.lastSuccessfulScanMs,
+    );
+  }
+
+  upsertInputProvenance(record: InputProvenanceRecord): void {
+    inputProvenanceRecordSchema.parse(record);
+    const originKey = createHash("sha256").update(JSON.stringify([
+      record.agent,
+      record.nativeSessionId,
+      record.nativeInputId,
+      record.origin,
+      record.controller,
+    ])).digest("hex");
+    this.database.query(`
+      INSERT INTO input_provenance (
+        origin_key, agent, native_session_id, native_input_id, origin, controller
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(origin_key) DO UPDATE SET
+        agent=excluded.agent, native_session_id=excluded.native_session_id,
+        native_input_id=excluded.native_input_id, origin=excluded.origin,
+        controller=excluded.controller
+    `).run(
+      originKey, record.agent, record.nativeSessionId, record.nativeInputId,
+      record.origin, record.controller,
     );
   }
 
@@ -846,6 +1003,16 @@ export class CollectorStore {
   getUsage(originKey: string): Record<string, unknown> | null {
     requireText(originKey, "originKey");
     return this.database.query("SELECT * FROM usage WHERE origin_key = ?").get(originKey) as Record<string, unknown> | null;
+  }
+
+  getInput(originKey: string): Record<string, unknown> | null {
+    requireText(originKey, "originKey");
+    return this.database.query("SELECT * FROM input_events WHERE origin_key = ?").get(originKey) as Record<string, unknown> | null;
+  }
+
+  getInputSourceState(sourceKey: string): Record<string, unknown> | null {
+    requireText(sourceKey, "sourceKey");
+    return this.database.query("SELECT * FROM input_source_state WHERE source_key = ?").get(sourceKey) as Record<string, unknown> | null;
   }
 
   getCounterSnapshot(sourceKey: string, counterKey: string): Record<string, unknown> | null {

@@ -83,6 +83,23 @@ function emptyCumulative(seconds: number, ordinal: number): Record<string, unkno
   }, seconds, ordinal);
 }
 
+function userInput(
+  id: string,
+  kinds: string[] | null,
+  seconds: number,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return record("response_item", {
+    type: "message",
+    role: "user",
+    id,
+    ...(kinds === null ? {} : {
+      internal_chat_message_metadata_passthrough: { content_item_kinds: kinds, turn_id: "shared-accounting-turn" },
+    }),
+    ...extra,
+  }, seconds, seconds);
+}
+
 function jsonl(records: readonly Record<string, unknown>[]): string {
   return `${records.map((value) => JSON.stringify(value)).join("\n")}\n`;
 }
@@ -263,6 +280,48 @@ describe("Codex usage normalization", () => {
   });
 });
 
+describe("Codex input normalization", () => {
+  test("classifies ID-bearing user response items independently from accounting turns", () => {
+    const result = normalizeCodexJsonl(jsonl([
+      header({ originator: "fixture-controller" }),
+      userInput("submission-a", ["user.text"], 1),
+      userInput("submission-b", ["agents_md.instructions", "user.text"], 2),
+      userInput("context", ["agents_md.instructions"], 3),
+      userInput("unknown", null, 4),
+      record("event_msg", { type: "user_message", message: "not a stable input" }, 5, 5),
+    ]));
+
+    expect(result.inputs).toHaveLength(4);
+    expect(result.inputs.map((input) => ({
+      id: input.nativeInputId,
+      kind: input.kind,
+      controller: input.controller,
+      origin: input.origin,
+      lane: input.lane,
+    })).sort((left, right) => left.id.localeCompare(right.id))).toEqual([
+      { id: "context", kind: "context", controller: "fixture-controller", origin: "unknown", lane: "main" },
+      { id: "submission-a", kind: "submission", controller: "fixture-controller", origin: "unknown", lane: "main" },
+      { id: "submission-b", kind: "submission", controller: "fixture-controller", origin: "unknown", lane: "main" },
+      { id: "unknown", kind: "unknown", controller: "fixture-controller", origin: "unknown", lane: "main" },
+    ]);
+    expect(result.inputReasons).toEqual(["input-kind-unknown"]);
+    const unsupported = normalizeCodexJsonl(jsonl([
+      header(),
+      record("event_msg", { type: "user_message", message: "not a stable input" }, 5, 5),
+    ]));
+    expect(unsupported.inputs).toEqual([]);
+    expect(unsupported.inputReasons).toEqual(["input-history-incomplete"]);
+  });
+
+  test("emits a unique session origin for each native session while preserving accounting identities", () => {
+    const first = normalizeCodexJsonl(jsonl([header({ id: "fork-a", origin_session_id: "root" })]));
+    const second = normalizeCodexJsonl(jsonl([header({ id: "fork-b", origin_session_id: "root" })]));
+    expect(first.sessions[0]?.originKey).not.toBe(second.sessions[0]?.originKey);
+    expect(first.sessions[0]?.canonicalSessionKey).toBe("root");
+    expect(second.sessions[0]?.canonicalSessionKey).toBe("root");
+  });
+});
+
 describe("Codex measured work normalization", () => {
   test("includes timed inference and tool items while excluding projections and waits", () => {
     const included = [
@@ -338,6 +397,7 @@ describe("Codex adapter collection", () => {
     writeFileSync(rolloutPath, jsonl([
       header({ id: "synthetic-child" }),
       turn(),
+      userInput("historical-input", ["user.text"], 1),
       modern("first-collected-response", counters(6, 4), 2, 2),
     ]));
 
@@ -367,6 +427,15 @@ describe("Codex adapter collection", () => {
     };
     const store = CollectorStore.open(stateDir);
     try {
+      const legacyCursorBatch = await codexAdapter.collect({
+        config,
+        store,
+        rebuild: false,
+        cutoffMs: BASE + 60_000,
+        reconcileAll: false,
+      });
+      store.writeBatch({ fileCursors: legacyCursorBatch.fileCursors });
+      expect(store.getInputSourceState("codex")).toBeNull();
       const first = await codexAdapter.collect({
         config,
         store,
@@ -378,9 +447,11 @@ describe("Codex adapter collection", () => {
         sessionKey: "synthetic-child",
         parentSessionKey: "synthetic-parent",
       });
+      expect(first.inputs.map((input) => input.nativeInputId)).toEqual(["historical-input"]);
       expect(first.usage).toHaveLength(1);
       const initialJsonl = jsonl([
         header({ id: "synthetic-child" }),
+        userInput("historical-input", ["user.text"], 1),
         turn(),
         modern("first-collected-response", counters(6, 4), 2, 2),
       ]);
@@ -389,6 +460,8 @@ describe("Codex adapter collection", () => {
         sources: [first.source],
         sessions: first.sessions,
         usage: first.usage,
+        inputs: first.inputs,
+        inputSourceStates: [first.inputSourceState],
         workIntervals: first.workIntervals,
         counterSnapshots: first.counterSnapshots,
         fileCursors: first.fileCursors,
@@ -414,6 +487,8 @@ describe("Codex adapter collection", () => {
         sources: [second.source],
         sessions: second.sessions,
         usage: second.usage,
+        inputs: second.inputs,
+        inputSourceStates: [second.inputSourceState],
         workIntervals: second.workIntervals,
         counterSnapshots: second.counterSnapshots,
         fileCursors: second.fileCursors,

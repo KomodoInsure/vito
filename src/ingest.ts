@@ -4,7 +4,8 @@ import { isAbsolute, normalize } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { canonicalizePotentialPath, loadConfig, isPathWithin, type Config } from "./config";
-import type { UsageRecord, WorkInterval } from "./contracts";
+import type { InputRecord, UsageRecord, WorkInterval } from "./contracts";
+import { mergeInputRecords, storedInputReasons } from "./inputs";
 import { discoverGitRepositories } from "./git";
 import { withWriterLock } from "./lock";
 import {
@@ -354,10 +355,11 @@ export function filterAdapterBatch(
   config: Config,
   sharedResolver?: ScopeResolver,
   observedAtMs = Date.now(),
-): Omit<AdapterBatch, "sessions" | "usage" | "workIntervals"> & {
+): Omit<AdapterBatch, "sessions" | "usage" | "workIntervals" | "inputs"> & {
   sessions: Array<SessionRecord & ScopeMembership>;
   usage: Array<UsageRecord & ScopeMembership>;
   workIntervals: Array<WorkInterval & ScopeMembership>;
+  inputs: Array<InputRecord & ScopeMembership>;
   excludedUnattributedRecords: number;
   workspaceAttributions: WorkspaceAttribution[];
   scopeEvidence: ScopeEvidence[];
@@ -401,6 +403,19 @@ export function filterAdapterBatch(
       scopeReason: scope.scopeReason,
     };
   });
+  const inputs = mergeInputRecords(batch.inputs).map((record) => {
+    const scope = hasAbsoluteAttribution(record.workspaceKey, record.repositoryKey)
+      ? resolver.resolve(record.agent, record.sessionKey, record.workspaceKey, record.repositoryKey)
+      : scopedSessions.scopes.get(`${record.agent}\0${record.sessionKey}`) ??
+        resolver.resolve(record.agent, record.sessionKey, null);
+    return {
+      ...record,
+      workspaceKey: scope.workspaceKey,
+      repositoryKey: scope.repositoryKey,
+      scopeDecision: scope.scopeDecision,
+      scopeReason: scope.scopeReason,
+    };
+  });
 
   const scopeEvidence: ScopeEvidence[] = usage.map((record) => ({
     originKey: record.originKey,
@@ -436,6 +451,7 @@ export function filterAdapterBatch(
     sessions: scopedSessions.records,
     usage,
     workIntervals,
+    inputs,
     excludedUnattributedRecords,
     workspaceAttributions: scopedSessions.attributions,
     scopeEvidence,
@@ -504,6 +520,17 @@ function reconcileStoredScope(store: CollectorStore, resolver: ScopeResolver, ob
       WHERE origin_key = ?
     `).run(scope.workspaceKey, scope.repositoryKey, scope.scopeDecision, scope.scopeReason, row.origin_key);
   }
+
+  const inputs = store.database.query(`
+    SELECT origin_key, agent, session_key, workspace_key, repository_key FROM input_events
+  `).all() as StoredScopeRow[];
+  for (const row of inputs) {
+    const scope = resolver.resolve(row.agent, row.session_key, row.workspace_key, row.repository_key);
+    store.database.query(`
+      UPDATE input_events SET workspace_key = ?, repository_key = ?, scope_decision = ?, scope_reason = ?
+      WHERE origin_key = ?
+    `).run(scope.workspaceKey, scope.repositoryKey, scope.scopeDecision, scope.scopeReason, row.origin_key);
+  }
 }
 
 export async function collectIntoStore(
@@ -540,19 +567,40 @@ export async function collectIntoStore(
       if (collected.source.agent !== adapter.agent) {
         throw new Error(`Adapter ${adapter.agent} returned a source record for another agent`);
       }
+      if (collected.inputSourceState.agent !== adapter.agent) {
+        throw new Error(`Adapter ${adapter.agent} returned input state for another agent`);
+      }
       const batch = filterAdapterBatch(collected, config, resolver, cutoffMs);
       const sourceAvailable = batch.source.state === "available" || batch.source.state === "partial";
+      const previousInputState = store.getInputSourceState(batch.inputSourceState.sourceKey);
+      const effectiveInputState = batch.inputSourceState.quality === "unavailable"
+        ? {
+            ...batch.inputSourceState,
+            reasons: [...new Set([
+              ...storedInputReasons(previousInputState),
+              ...batch.inputSourceState.reasons,
+            ])].sort(),
+            lastSuccessfulScanMs: typeof previousInputState?.last_successful_scan_ms === "number"
+              ? previousInputState.last_successful_scan_ms
+              : null,
+          }
+        : batch.inputSourceState;
       store.transaction(() => {
         if (!sourceAvailable) {
           // Inventory freshness changes, while retained facts are reclassified
           // against the current scope without being erased.
-          store.writeBatch({ sources: [batch.source] });
+          store.writeBatch({
+            sources: [batch.source],
+            inputSourceStates: [effectiveInputState],
+          });
         } else {
           store.writeBatch({
             sources: [batch.source],
             sessions: batch.sessions,
             usage: batch.usage,
             workIntervals: batch.workIntervals,
+            inputs: batch.inputs,
+            inputSourceStates: [effectiveInputState],
             counterSnapshots: batch.counterSnapshots,
             fileCursors: batch.fileCursors,
             workspaceAttributions: batch.workspaceAttributions,
@@ -565,7 +613,12 @@ export async function collectIntoStore(
       unallocatedUsageRecords += batch.unallocatedUsageRecords;
       excludedAmbiguousRecords += batch.excludedAmbiguousRecords;
       excludedUnattributedRecords += batch.excludedUnattributedRecords;
-      if (batch.source.state !== "available" || batch.source.tokenQuality !== "recorded" || batch.source.workQuality !== "recorded") {
+      if (
+        batch.source.state !== "available"
+        || batch.source.tokenQuality !== "recorded"
+        || batch.source.workQuality !== "recorded"
+        || effectiveInputState.quality !== "recorded"
+      ) {
         status = "partial";
       }
     }

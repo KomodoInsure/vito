@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { UsageRecord, WorkInterval } from "../src/contracts";
+import type { InputRecord, UsageRecord, WorkInterval } from "../src/contracts";
 import { WRITER_LOCK_DIRECTORY, WriterLock, WriterLockBusyError, withWriterLock } from "../src/lock";
 import { CollectorStore } from "../src/store";
 
@@ -63,6 +63,27 @@ function interval(endMs: number): WorkInterval {
   };
 }
 
+function input(originKey = "input:one"): InputRecord {
+  return {
+    originKey,
+    sourceKey: "source:one",
+    agent: "codex",
+    sessionKey: "session:one",
+    nativeSessionId: "native-session",
+    nativeInputId: "native-input",
+    workspaceKey: "workspace:synthetic",
+    repositoryKey: null,
+    atMs: 1_700_000_000_000,
+    kind: "submission",
+    lane: "main",
+    controller: null,
+    origin: "unknown",
+    originEvidence: "none",
+    quality: "recorded",
+    reasons: [],
+  };
+}
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
@@ -79,6 +100,9 @@ describe("CollectorStore", () => {
         "commits",
         "counter_snapshots",
         "file_cursors",
+        "input_events",
+        "input_provenance",
+        "input_source_state",
         "scope_evidence",
         "sessions",
         "sources",
@@ -97,9 +121,14 @@ describe("CollectorStore", () => {
         "work_intervals_session_idx",
         "commits_committer_idx",
         "commits_repository_time_idx",
+        "input_events_agent_at_idx",
+        "input_events_session_idx",
+        "input_events_source_idx",
+        "input_events_native_idx",
+        "input_provenance_native_idx",
       ]) expect(indexes.has(required)).toBe(true);
 
-      expect((store.database.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(2);
+      expect((store.database.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3);
       expect((store.database.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toBe("wal");
       expect(statSync(store.path).mode & 0o777).toBe(0o600);
       expect(statSync(store.stateDir).mode & 0o777).toBe(0o700);
@@ -122,6 +151,91 @@ describe("CollectorStore", () => {
       expect((store.database.query("SELECT end_ms FROM work_intervals WHERE origin_key = ?").get("interval:one") as { end_ms: number }).end_ms).toBe(3_000);
     } finally {
       store.close();
+    }
+  });
+
+  test("strictly persists input facts, source state, and distinct provenance claims", () => {
+    const store = CollectorStore.open(temporaryState());
+    try {
+      store.writeBatch({
+        inputs: [{ ...input(), scopeDecision: "out-of-scope", scopeReason: "configured-root" }],
+        inputSourceStates: [{
+          sourceKey: "source:one",
+          agent: "codex",
+          parserVersion: 1,
+          quality: "recorded",
+          reasons: [],
+          scannedAtMs: 20,
+          lastSuccessfulScanMs: 20,
+        }],
+        inputProvenance: [
+          {
+            originKey: "ignored-by-store",
+            agent: "codex",
+            nativeSessionId: "native-session",
+            nativeInputId: "native-input",
+            origin: "human",
+            controller: "runner",
+          },
+          {
+            originKey: "also-ignored",
+            agent: "codex",
+            nativeSessionId: "native-session",
+            nativeInputId: "native-input",
+            origin: "human",
+            controller: "runner",
+          },
+          {
+            originKey: "contrary",
+            agent: "codex",
+            nativeSessionId: "native-session",
+            nativeInputId: "native-input",
+            origin: "automated",
+            controller: "runner",
+          },
+        ],
+      });
+
+      expect(store.database.query("SELECT * FROM input_events WHERE origin_key = 'input:one'").get()).toMatchObject({
+        native_session_id: "native-session",
+        native_input_id: "native-input",
+        scope_decision: "out-of-scope",
+      });
+      expect(store.getInputSourceState("source:one")).toMatchObject({
+        parser_version: 1,
+        quality: "recorded",
+        last_successful_scan_ms: 20,
+      });
+      expect((store.database.query("SELECT count(*) AS count FROM input_provenance").get() as { count: number }).count).toBe(2);
+      expect(() => store.upsertInput({ ...input("invalid"), controller: "" })).toThrow();
+      expect(() => store.upsertInputSourceState({
+        sourceKey: "invalid",
+        agent: "codex",
+        parserVersion: 1,
+        quality: "recorded",
+        reasons: [],
+        scannedAtMs: -1,
+        lastSuccessfulScanMs: null,
+      })).toThrow();
+    } finally {
+      store.close();
+    }
+  });
+
+  test("migrates a version-two ledger without disturbing retained accounting", () => {
+    const state = temporaryState();
+    const first = CollectorStore.open(state);
+    first.upsertUsage(usage(10), 1);
+    first.database.exec("DROP TABLE input_events; DROP TABLE input_source_state; DROP TABLE input_provenance; PRAGMA user_version = 2;");
+    first.close();
+
+    const migrated = CollectorStore.open(state);
+    try {
+      expect((migrated.database.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3);
+      expect(migrated.getUsage("response:one")?.total).toBe(10);
+      expect((migrated.database.query("SELECT count(*) AS count FROM input_events").get() as { count: number }).count).toBe(0);
+    } finally {
+      migrated.close();
     }
   });
 

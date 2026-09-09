@@ -85,6 +85,8 @@ function commitBatch(store: CollectorStore, batch: AdapterBatch): void {
     sessions: batch.sessions,
     usage: batch.usage,
     workIntervals: batch.workIntervals,
+    inputs: batch.inputs,
+    inputSourceStates: [batch.inputSourceState],
     counterSnapshots: batch.counterSnapshots,
     fileCursors: batch.fileCursors,
   });
@@ -134,7 +136,13 @@ function assistant(start: number, completed: number | undefined, total = 16, cos
 }
 
 function user(created: number): Record<string, unknown> {
-  return { role: "user", time: { created } };
+  return {
+    agent: "build",
+    model: { providerID: "fixture-provider", modelID: "fixture-model" },
+    role: "user",
+    summary: { title: "fixture" },
+    time: { created },
+  };
 }
 
 afterEach(() => {
@@ -279,6 +287,89 @@ describe("OpenCode SQLite adapter", () => {
       expect(batch.excludedAmbiguousRecords).toBe(0);
       expect(batch.sessions.find((session) => session.sessionKey.endsWith(":session-copy"))?.canonicalSessionKey)
         .toBe(batch.sessions.find((session) => session.sessionKey.endsWith(":session-original"))?.sessionKey);
+      expect(batch.inputs.filter((input) => input.kind === "submission")).toHaveLength(1);
+      expect(batch.inputs.filter((input) => input.kind === "replay")).toHaveLength(1);
+      expect(batch.inputs.find((input) => input.nativeInputId === "user-copy")).toMatchObject({
+        kind: "replay",
+        lane: "main",
+        origin: "unknown",
+      });
+    } finally {
+      writer.close();
+      store.close();
+    }
+  });
+
+  test("reclassifies a retained copied prefix when an older original appears later", async () => {
+    const root = temporaryDirectory();
+    const sourcePath = join(root, "opencode.db");
+    const stateDir = join(root, "state");
+    const writer = createSourceDatabase(sourcePath);
+    const store = CollectorStore.open(stateDir);
+    try {
+      insertSession(writer, "session-copy", 2_000);
+      insertMessage(writer, "user-copy", "session-copy", 1_100, user(1_100));
+      insertMessage(writer, "assistant-copy", "session-copy", 1_200, assistant(1_200, 1_300));
+      insertPart(writer, "text-copy", "user-copy", "session-copy", 1_100, { type: "text", text: "synthetic request" });
+      insertPart(writer, "step-copy", "assistant-copy", "session-copy", 1_300, { type: "step-finish", reason: "stop" });
+
+      const config = configuration(sourcePath, stateDir);
+      const first = await opencodeAdapter.collect(context(config, store));
+      commitBatch(store, first);
+      expect(first.inputs.find((input) => input.nativeInputId === "user-copy")?.kind).toBe("submission");
+
+      insertSession(writer, "session-original", 1_000);
+      insertMessage(writer, "user-original", "session-original", 1_100, user(1_100));
+      insertMessage(writer, "assistant-original", "session-original", 1_200, assistant(1_200, 1_300));
+      insertPart(writer, "text-original", "user-original", "session-original", 1_100, { type: "text", text: "synthetic request" });
+      insertPart(writer, "step-original", "assistant-original", "session-original", 1_300, { type: "step-finish", reason: "stop" });
+
+      const second = await opencodeAdapter.collect(context(config, store, { rebuild: false }));
+      commitBatch(store, second);
+      const storedKinds = store.database.query(`
+        SELECT native_input_id AS id, kind FROM input_events ORDER BY native_input_id
+      `).all();
+      expect(storedKinds).toEqual([
+        { id: "user-copy", kind: "replay" },
+        { id: "user-original", kind: "submission" },
+      ]);
+      const originalSessionKey = second.sessions
+        .find((session) => session.sessionKey.endsWith(":session-original"))?.sessionKey;
+      expect(second.sessions.find((session) => session.sessionKey.endsWith(":session-copy"))?.canonicalSessionKey)
+        .toBe(originalSessionKey);
+    } finally {
+      writer.close();
+      store.close();
+    }
+  });
+
+  test("counts one plain-text user message and marks unfamiliar parts unknown", async () => {
+    const root = temporaryDirectory();
+    const sourcePath = join(root, "opencode.db");
+    const writer = createSourceDatabase(sourcePath);
+    const store = CollectorStore.open(join(root, "state"));
+    try {
+      insertSession(writer, "parent", 1_000);
+      writer.query("UPDATE session SET parent_id = ? WHERE id = ?").run("branch-parent", "parent");
+      insertMessage(writer, "plain", "parent", 1_100, user(1_100));
+      insertPart(writer, "plain-text", "plain", "parent", 1_100, { type: "text", text: "private request" });
+      insertMessage(writer, "attachment", "parent", 1_200, user(1_200));
+      insertPart(writer, "attachment-part", "attachment", "parent", 1_200, { type: "file", path: "/private" });
+
+      const batch = await opencodeAdapter.collect(context(configuration(sourcePath, join(root, "state")), store));
+      expect(batch.inputs.map((input) => ({
+        id: input.nativeInputId,
+        kind: input.kind,
+        lane: input.lane,
+      })).sort((left, right) => left.id.localeCompare(right.id))).toEqual([
+        { id: "attachment", kind: "unknown", lane: "unknown" },
+        { id: "plain", kind: "submission", lane: "unknown" },
+      ]);
+      expect(batch.inputSourceState).toMatchObject({
+        parserVersion: 1,
+        quality: "partial",
+        reasons: ["input-kind-unknown"],
+      });
     } finally {
       writer.close();
       store.close();

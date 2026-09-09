@@ -50,6 +50,18 @@ function withMessage(record: Record<string, unknown>, changes: Record<string, un
   return { ...record, message: { ...(record.message as Record<string, unknown>), ...changes } };
 }
 
+function user(uuid: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    type: "user",
+    sessionId: "parent-session",
+    uuid,
+    cwd: "/synthetic/company/project",
+    timestamp: FIRST,
+    message: { role: "user", content: "input" },
+    ...overrides,
+  };
+}
+
 describe("Claude normalization", () => {
   test("deduplicates repeated assistant blocks and treats prompt buckets as disjoint", () => {
     const first = assistant({ uuid: "thinking-block" });
@@ -205,6 +217,46 @@ describe("Claude normalization", () => {
     expect(result.workIntervals).toEqual([]);
     expect(result.diagnosticCounts.ignoredParentSummaries).toBe(2);
   });
+  test("classifies native user records by explicit origin and content shape", () => {
+    const result = normalizeClaudeRecords([
+      raw(user("human", { origin: { kind: "human" } }), undefined, 1),
+      raw(user("scheduled", {
+        isMeta: true,
+        scheduledTaskId: "task",
+        scheduledFireId: "fire",
+      }), undefined, 2),
+      raw(user("peer", { origin: { kind: "peer" } }), undefined, 3),
+      raw(user("notification", { origin: { kind: "task-notification" } }), undefined, 4),
+      raw(user("tool-result", { message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tool" }] } }), undefined, 5),
+      raw(user("interrupted", { interruptedMessageId: "prior" }), undefined, 6),
+      raw(user("unknown", { channel: "cli", userType: "external" }), undefined, 7),
+      raw(user("mixed", { message: { role: "user", content: [{ type: "text", text: "input" }, { type: "tool_result" }] } }), undefined, 8),
+      raw(user("child", { agentId: "child-agent", isSidechain: true, origin: { kind: "human" } }), undefined, 9),
+    ]);
+
+    const inputs = Object.fromEntries(result.inputs.map((input) => [input.nativeInputId, input]));
+    expect(inputs.human).toMatchObject({ kind: "submission", origin: "human", originEvidence: "source", lane: "main" });
+    expect(inputs.scheduled).toMatchObject({ kind: "submission", origin: "automated", originEvidence: "source" });
+    expect(inputs.peer).toMatchObject({ kind: "submission", origin: "automated", originEvidence: "source" });
+    expect(inputs.notification).toMatchObject({ kind: "context", origin: "unknown" });
+    expect(inputs["tool-result"]).toMatchObject({ kind: "context" });
+    expect(inputs.interrupted).toMatchObject({ kind: "context" });
+    expect(inputs.unknown).toMatchObject({ kind: "submission", origin: "unknown", originEvidence: "none" });
+    expect(inputs.mixed).toMatchObject({ kind: "unknown", quality: "partial", reasons: ["input-kind-unknown"] });
+    expect(inputs.child).toMatchObject({ lane: "subagent" });
+  });
+
+  test("deduplicates replayed UUIDs independently of assistant responses", () => {
+    const original = user("shared", { sessionId: "parent-session", origin: { kind: "human" } });
+    const copy = user("shared", { sessionId: "fork-session", origin: { kind: "human" } });
+    const result = normalizeClaudeRecords([
+      raw(original, "/synthetic/original.jsonl", 1, 1),
+      raw(copy, "/synthetic/fork.jsonl", 1, 2),
+    ]);
+    expect(result.inputs).toHaveLength(1);
+    expect(result.inputs[0]).toMatchObject({ nativeSessionId: "parent-session", nativeInputId: "shared" });
+  });
+
 });
 describe("Claude adapter collection", () => {
   test("upgrades an appended incomplete response once without moving its first timestamp", async () => {
@@ -256,6 +308,8 @@ describe("Claude adapter collection", () => {
         sources: [first.source],
         sessions: first.sessions,
         usage: first.usage,
+        inputs: first.inputs,
+        inputSourceStates: [first.inputSourceState],
         fileCursors: first.fileCursors,
       });
 
@@ -267,6 +321,8 @@ describe("Claude adapter collection", () => {
         sources: [second.source],
         sessions: second.sessions,
         usage: second.usage,
+        inputs: second.inputs,
+        inputSourceStates: [second.inputSourceState],
         fileCursors: second.fileCursors,
       });
 

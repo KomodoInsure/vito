@@ -1,5 +1,5 @@
 import type { Config } from "../config";
-import type { Agent, Quality, UsageRecord, WorkInterval } from "../contracts";
+import type { Agent, InputRecord, InputSourceState, Quality, UsageRecord, WorkInterval } from "../contracts";
 import type {
   CollectorStore,
   CounterSnapshot,
@@ -43,6 +43,8 @@ export interface AdapterBatch {
   sessions: SessionRecord[];
   usage: UsageRecord[];
   workIntervals: WorkInterval[];
+  inputs: InputRecord[];
+  inputSourceState: InputSourceState;
   counterSnapshots: CounterSnapshot[];
   fileCursors: FileCursor[];
   unallocatedUsageRecords: number;

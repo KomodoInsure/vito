@@ -57,6 +57,8 @@ function createHermesDatabase(path: string, legacy = false): Database {
       ${legacy ? "" : "last_activity_at REAL,"}
       cwd TEXT,
       git_repo_root TEXT,
+      chat_id TEXT,
+      thread_id TEXT,
       input_tokens INTEGER DEFAULT 0,
       output_tokens INTEGER DEFAULT 0,
       cache_read_tokens INTEGER DEFAULT 0,
@@ -90,6 +92,18 @@ function createHermesDatabase(path: string, legacy = false): Database {
       last_seen REAL,
       PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
     );
+    CREATE TABLE messages (
+      id INTEGER PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      timestamp REAL,
+      platform_message_id TEXT,
+      observed INTEGER NOT NULL DEFAULT 0,
+      active INTEGER NOT NULL DEFAULT 1,
+      compacted INTEGER NOT NULL DEFAULT 0,
+      display_kind TEXT,
+      _compressed_summary INTEGER NOT NULL DEFAULT 0
+    );
   `);
   return database;
 }
@@ -113,6 +127,8 @@ function insertSession(
     last_activity_at: ended,
     cwd: options.workspace ?? "/synthetic/workspace",
     git_repo_root: options.workspace ?? "/synthetic/workspace",
+    chat_id: "synthetic-chat",
+    thread_id: null,
     input_tokens: input,
     output_tokens: options.output ?? 0,
     cache_read_tokens: 0,
@@ -165,6 +181,40 @@ function updateUsage(database: Database, sessionId: string, input: number, lastS
   database.query("UPDATE sessions SET input_tokens = ?, ended_at = ? WHERE id = ?").run(input, lastSeen, sessionId);
 }
 
+function insertMessage(
+  database: Database,
+  id: number,
+  sessionId: string,
+  options: {
+    role?: string;
+    timestamp?: number;
+    platformId?: string | null;
+    observed?: number;
+    active?: number;
+    compacted?: number;
+    displayKind?: string | null;
+    compressedSummary?: number;
+  } = {},
+): void {
+  database.query(`
+    INSERT INTO messages (
+      id, session_id, role, timestamp, platform_message_id, observed,
+      active, compacted, display_kind, _compressed_summary
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    sessionId,
+    options.role ?? "user",
+    options.timestamp ?? DAY_ONE,
+    options.platformId ?? null,
+    options.observed ?? 0,
+    options.active ?? 1,
+    options.compacted ?? 0,
+    options.displayKind ?? null,
+    options.compressedSummary ?? 0,
+  );
+}
+
 function config(sourcePaths: string[], stateDir: string): Config {
   return {
     version: 1,
@@ -193,6 +243,8 @@ function commit(store: CollectorStore, batch: AdapterBatch): void {
     sessions: batch.sessions,
     usage: batch.usage,
     workIntervals: batch.workIntervals,
+    inputs: batch.inputs,
+    inputSourceStates: [batch.inputSourceState],
     counterSnapshots: batch.counterSnapshots,
     fileCursors: batch.fileCursors,
   });
@@ -488,6 +540,63 @@ describe("Hermes cumulative accounting", () => {
       costKind: "included",
       partial: false,
     });
+  });
+
+  test("certifies stable platform inputs and keeps ambiguous physical rows as coverage candidates", async () => {
+    const root = temporaryRoot();
+    const path = join(root, "state.db");
+    const source = createHermesDatabase(path);
+    insertSession(source, "main", 0);
+    insertSession(source, "parented", 0, { parentId: "main" });
+    insertMessage(source, 1, "main", { platformId: "platform-one" });
+    insertMessage(source, 2, "main", { platformId: "platform-one", compacted: 1, active: 0 });
+    insertMessage(source, 3, "main", { platformId: "ambient", observed: 1 });
+    insertMessage(source, 4, "main", { platformId: "delegation", displayKind: "async_delegation_complete" });
+    insertMessage(source, 5, "main", { platformId: "display", displayKind: "status" });
+    insertMessage(source, 6, "main", { platformId: "summary", compressedSummary: 1 });
+    insertMessage(source, 7, "main");
+    insertMessage(source, 8, "parented", { platformId: "parented-input" });
+    source.close();
+    const store = fixtureStore(root);
+    try {
+      const batch = await collect(store, [path]);
+      const byId = Object.fromEntries(batch.inputs.map((input) => [input.nativeInputId, input]));
+      expect(batch.inputs.filter((input) => input.nativeInputId === "platform-one")).toHaveLength(1);
+      expect(byId["platform-one"]).toMatchObject({ kind: "submission", lane: "main", origin: "unknown" });
+      expect(byId.ambient).toMatchObject({ kind: "context" });
+      expect(byId.delegation).toMatchObject({ kind: "context" });
+      expect(byId.display).toMatchObject({ kind: "unknown" });
+      expect(byId.summary).toMatchObject({ kind: "unknown" });
+      expect(byId["7"]).toMatchObject({ kind: "unknown" });
+      expect(byId["parented-input"]).toMatchObject({ kind: "submission", lane: "unknown" });
+      expect(batch.inputSourceState).toMatchObject({
+        parserVersion: 1,
+        quality: "partial",
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  test("reports input counts unavailable when only identity-ambiguous rows exist", async () => {
+    const root = temporaryRoot();
+    const path = join(root, "state.db");
+    const source = createHermesDatabase(path);
+    insertSession(source, "ambiguous", 0);
+    insertMessage(source, 1, "ambiguous");
+    source.close();
+    const store = fixtureStore(root);
+    try {
+      const batch = await collect(store, [path]);
+      expect(batch.inputs).toHaveLength(1);
+      expect(batch.inputs[0]).toMatchObject({ nativeInputId: "1", kind: "unknown" });
+      expect(batch.inputSourceState).toMatchObject({
+        quality: "unavailable",
+        reasons: expect.arrayContaining(["input-history-incomplete", "input-kind-unknown"]),
+      });
+    } finally {
+      store.close();
+    }
   });
 
   test("probes legacy columns and sees committed rows still resident in a live WAL", async () => {
