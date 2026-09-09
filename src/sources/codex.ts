@@ -1128,7 +1128,7 @@ export const codexAdapter: SourceAdapter = {
     const inputs = mergeInputRecords(
       currentInputs,
       retainedInputRecords(context.store, currentInputs.map((record) => record.originKey)),
-    );
+    ).map((record) => ({ ...record, sourceKey: "codex" }));
     if (inputs.some((input) => input.kind === "unknown")) inputReasons.add("input-kind-unknown");
     const previousSuccessfulScan = typeof priorInputState?.last_successful_scan_ms === "number"
       ? priorInputState.last_successful_scan_ms

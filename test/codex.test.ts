@@ -474,6 +474,9 @@ describe("Codex adapter collection", () => {
         parentSessionKey: "synthetic-parent",
       });
       expect(first.inputs.map((input) => input.nativeInputId)).toEqual(["historical-input"]);
+      expect(new Set(first.inputs.map((input) => input.sourceKey))).toEqual(
+        new Set([first.inputSourceState.sourceKey]),
+      );
       expect(first.usage).toHaveLength(1);
       const initialJsonl = jsonl([
         header({ id: "synthetic-child" }),
