@@ -317,12 +317,26 @@ describe("Codex input normalization", () => {
       record("event_msg", { type: "user_message", turn_id: "unmatched-turn" }, 2, 2),
     ]));
     expect(mixed.inputReasons).toEqual(["input-history-incomplete"]);
-    const mirrored = normalizeCodexJsonl(jsonl([
+    const sameTurnDistinctSubmission = normalizeCodexJsonl(jsonl([
       header(),
       userInput("verified", ["user.text"], 1),
-      record("event_msg", { type: "user_message", turn_id: "shared-accounting-turn" }, 2, 2),
+      record("event_msg", {
+        type: "user_message",
+        id: "distinct-unsupported",
+        turn_id: "shared-accounting-turn",
+      }, 2, 2),
     ]));
-    expect(mirrored.inputReasons).toEqual([]);
+    expect(sameTurnDistinctSubmission.inputReasons).toEqual(["input-history-incomplete"]);
+    const nativeIdMirror = normalizeCodexJsonl(jsonl([
+      header(),
+      userInput("verified", ["user.text"], 1),
+      record("event_msg", {
+        type: "user_message",
+        id: "verified",
+        turn_id: "different-accounting-turn",
+      }, 2, 2),
+    ]));
+    expect(nativeIdMirror.inputReasons).toEqual([]);
   });
 
   test("emits a unique session origin for each native session while preserving accounting identities", () => {

@@ -263,8 +263,8 @@ class CodexNormalizer {
   readonly reasons = new Set<string>();
   unallocatedUsageRecords = 0;
   private readonly inputReasons = new Set<string>();
-  private readonly verifiedInputTurns = new Set<string>();
-  private readonly unsupportedInputTurns = new Set<string>();
+  private readonly verifiedInputIds = new Set<string>();
+  private readonly unsupportedInputIds = new Set<string>();
   private sawUnkeyedUnsupportedInputProjection = false;
 
   private readonly state: ContextState;
@@ -332,7 +332,7 @@ class CodexNormalizer {
       return;
     }
     if (type === "event_msg" && payload.type === "user_message") {
-      this.noteUnsupportedInputProjection(record, payload);
+      this.noteUnsupportedInputProjection(payload);
       return;
     }
     if (type === "turn_context") {
@@ -352,7 +352,7 @@ class CodexNormalizer {
     if (type === "event_msg" && payload.type === "item_completed") {
       const item = object(payload.item);
       if (normalizedItemType(item?.type) === "usermessage") {
-        this.noteUnsupportedInputProjection(record, payload, item);
+        this.noteUnsupportedInputProjection(payload, item);
       }
       this.acceptTimedItem(record, payload);
     }
@@ -406,7 +406,7 @@ class CodexNormalizer {
     }
     if (
       this.sawUnkeyedUnsupportedInputProjection
-      || [...this.unsupportedInputTurns].some((turn) => !this.verifiedInputTurns.has(turn))
+      || [...this.unsupportedInputIds].some((inputId) => !this.verifiedInputIds.has(inputId))
     ) {
       this.inputReasons.add("input-history-incomplete");
     }
@@ -469,9 +469,8 @@ class CodexNormalizer {
       this.inputReasons.add("input-history-incomplete");
       return;
     }
+    this.verifiedInputIds.add(nativeInputId);
     const metadata = object(payload.internal_chat_message_metadata_passthrough);
-    const inputTurn = stringValue(metadata?.turn_id);
-    if (inputTurn !== null) this.verifiedInputTurns.add(inputTurn);
     const rawKinds = metadata?.content_item_kinds;
     const kinds = Array.isArray(rawKinds)
       ? rawKinds.filter((kind): kind is string => typeof kind === "string")
@@ -510,15 +509,12 @@ class CodexNormalizer {
   }
 
   private noteUnsupportedInputProjection(
-    record: UnknownRecord,
     payload: UnknownRecord,
     item: UnknownRecord | null = null,
   ): void {
-    const turn = stringValue(item?.turn_id)
-      ?? stringValue(payload.turn_id)
-      ?? stringValue(record.turn_id);
-    if (turn === null) this.sawUnkeyedUnsupportedInputProjection = true;
-    else this.unsupportedInputTurns.add(turn);
+    const nativeInputId = stringValue(item?.id) ?? stringValue(payload.id);
+    if (nativeInputId === null) this.sawUnkeyedUnsupportedInputProjection = true;
+    else this.unsupportedInputIds.add(nativeInputId);
   }
 
   private acceptModern(record: UnknownRecord, payload: UnknownRecord, atMs: number | null): void {
