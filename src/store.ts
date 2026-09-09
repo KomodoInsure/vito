@@ -287,6 +287,54 @@ CREATE INDEX IF NOT EXISTS input_events_native_idx ON input_events(agent, native
 CREATE INDEX IF NOT EXISTS input_provenance_native_idx ON input_provenance(agent, native_session_id, native_input_id);
 `;
 
+const REQUIRED_SCHEMA_TABLES = [
+  "collection_runs",
+  "commits",
+  "counter_snapshots",
+  "file_cursors",
+  "input_events",
+  "input_native_evidence",
+  "input_provenance",
+  "input_source_state",
+  "scope_evidence",
+  "sessions",
+  "sources",
+  "usage",
+  "work_intervals",
+  "workspace_attributions",
+] as const;
+
+const INPUT_NATIVE_EVIDENCE_COLUMNS = [
+  "origin_key",
+  "controller",
+  "origin",
+  "origin_evidence",
+] as const;
+
+function assertSchemaIntegrity(database: Database): void {
+  const tables = new Set((database.query(
+    "SELECT name FROM sqlite_master WHERE type = 'table'",
+  ).all() as Array<{ name: string }>).map((row) => row.name));
+  const missingTables = REQUIRED_SCHEMA_TABLES.filter((table) => !tables.has(table));
+  if (missingTables.length > 0) {
+    throw new Error(
+      `Collector database schema ${SCHEMA_VERSION} is incomplete; rebuild required (missing tables: ${missingTables.join(", ")})`,
+    );
+  }
+
+  const nativeEvidenceColumns = (database.query(
+    "PRAGMA table_info(input_native_evidence)",
+  ).all() as Array<{ name: string }>).map((row) => row.name);
+  if (
+    nativeEvidenceColumns.length !== INPUT_NATIVE_EVIDENCE_COLUMNS.length
+    || nativeEvidenceColumns.some((column, index) => column !== INPUT_NATIVE_EVIDENCE_COLUMNS[index])
+  ) {
+    throw new Error(
+      `Collector database schema ${SCHEMA_VERSION} has malformed native input evidence; rebuild required`,
+    );
+  }
+}
+
 const migrateVersionOneSql = `
 ALTER TABLE sessions ADD COLUMN scope_decision TEXT NOT NULL DEFAULT 'included'
   CHECK (scope_decision IN ('included','out-of-scope','unattributed'));
@@ -518,15 +566,20 @@ export class CollectorStore {
       if (versionRow.user_version > SCHEMA_VERSION) {
         throw new Error(`Collector database schema ${versionRow.user_version} is newer than supported schema ${SCHEMA_VERSION}`);
       }
-      database.exec("BEGIN IMMEDIATE");
-      try {
-        database.exec(schemaSql);
-        if (versionRow.user_version === 1) database.exec(migrateVersionOneSql);
-        database.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-        database.exec("COMMIT");
-      } catch (error) {
-        database.exec("ROLLBACK");
-        throw error;
+      if (versionRow.user_version === SCHEMA_VERSION) {
+        assertSchemaIntegrity(database);
+      } else {
+        database.exec("BEGIN IMMEDIATE");
+        try {
+          database.exec(schemaSql);
+          if (versionRow.user_version === 1) database.exec(migrateVersionOneSql);
+          database.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+          database.exec("COMMIT");
+        } catch (error) {
+          database.exec("ROLLBACK");
+          throw error;
+        }
+        assertSchemaIntegrity(database);
       }
       ensurePrivateFile(path);
       ensurePrivateFile(`${path}-wal`);
@@ -1033,18 +1086,6 @@ export class CollectorStore {
   getInputSourceState(sourceKey: string): Record<string, unknown> | null {
     requireText(sourceKey, "sourceKey");
     return this.database.query("SELECT * FROM input_source_state WHERE source_key = ?").get(sourceKey) as Record<string, unknown> | null;
-  }
-
-  listInputControllers(): string[] {
-    const rows = this.database.query(`
-      SELECT controller FROM input_events WHERE controller IS NOT NULL
-      UNION
-      SELECT controller FROM input_provenance WHERE controller IS NOT NULL
-      UNION
-      SELECT controller FROM input_native_evidence WHERE controller IS NOT NULL
-      ORDER BY controller
-    `).all() as Array<{ controller: string }>;
-    return rows.map((row) => row.controller);
   }
 
   getCounterSnapshot(sourceKey: string, counterKey: string): Record<string, unknown> | null {

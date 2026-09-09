@@ -227,7 +227,13 @@ describe("CollectorStore", () => {
     const state = temporaryState();
     const first = CollectorStore.open(state);
     first.upsertUsage(usage(10), 1);
-    first.database.exec("DROP TABLE input_events; DROP TABLE input_source_state; DROP TABLE input_provenance; PRAGMA user_version = 2;");
+    first.database.exec(`
+      DROP TABLE input_events;
+      DROP TABLE input_native_evidence;
+      DROP TABLE input_source_state;
+      DROP TABLE input_provenance;
+      PRAGMA user_version = 2;
+    `);
     first.close();
 
     const migrated = CollectorStore.open(state);
@@ -235,9 +241,35 @@ describe("CollectorStore", () => {
       expect((migrated.database.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3);
       expect(migrated.getUsage("response:one")?.total).toBe(10);
       expect((migrated.database.query("SELECT count(*) AS count FROM input_events").get() as { count: number }).count).toBe(0);
+      expect((migrated.database.query(
+        "SELECT count(*) AS count FROM input_native_evidence",
+      ).get() as { count: number }).count).toBe(0);
     } finally {
       migrated.close();
     }
+  });
+
+  test("rejects an incomplete version-three ledger instead of fabricating native evidence", () => {
+    const state = temporaryState();
+    const first = CollectorStore.open(state);
+    first.database.exec("DROP TABLE input_native_evidence");
+    first.close();
+
+    expect(() => CollectorStore.open(state)).toThrow(/schema 3 is incomplete.*rebuild/i);
+  });
+
+  test("rejects malformed version-three native evidence instead of accepting an empty baseline", () => {
+    const state = temporaryState();
+    const first = CollectorStore.open(state);
+    first.database.exec(`
+      DROP TABLE input_native_evidence;
+      CREATE TABLE input_native_evidence (
+        origin_key TEXT PRIMARY KEY
+      ) STRICT, WITHOUT ROWID;
+    `);
+    first.close();
+
+    expect(() => CollectorStore.open(state)).toThrow(/schema 3 has malformed native input evidence.*rebuild/i);
   });
 
   test("rolls facts and cursor/counter checkpoints back as one batch", () => {

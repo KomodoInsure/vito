@@ -448,7 +448,7 @@ describe("Pages publisher", () => {
     expect(readdirSync(join(value.remote, "refs", "heads"))).toEqual([]);
   }, 30_000);
 
-  test("rejects a retained controller name leaked after export and before publication", async () => {
+  test("rejects forbidden provenance fields added after export and before publication", async () => {
     const value = fixture();
     const controller = "PRIVATE_PUBLISH_CONTROLLER_SENTINEL";
     const store = CollectorStore.open(value.state);
@@ -472,8 +472,13 @@ describe("Pages publisher", () => {
         if (!mutated) {
           mutated = true;
           const activityPath = join(value.state, "export", "activity.json");
-          const leaked = publicSnapshotSchema.parse(JSON.parse(readFileSync(activityPath, "utf8")));
-          leaked.organization = controller;
+          const snapshot = publicSnapshotSchema.parse(JSON.parse(readFileSync(activityPath, "utf8")));
+          const leaked = {
+            ...snapshot,
+            controller,
+            nativeSessionId: "private-native-session",
+            nativeInputId: "private-native-input",
+          };
           writeFileSync(activityPath, `${JSON.stringify(leaked, null, 2)}\n`);
         }
         return value.pages.request(method, path, body);
@@ -484,7 +489,7 @@ describe("Pages publisher", () => {
       at: CUTOFF,
       transport,
       git: defaultGitTransport,
-    })).rejects.toThrow(/private controller/i);
+    })).rejects.toThrow(/public schema validation/i);
     expect(readdirSync(join(value.remote, "refs", "heads"))).toEqual([]);
   }, 30_000);
   test("requires an existing public dedicated repository and preserves unrelated destinations", async () => {

@@ -263,7 +263,7 @@ describe("static export", () => {
     })).toThrow(/validation failed/i);
   });
 
-  test("protects configured provenance paths and retained controller names from export", () => {
+  test("protects provenance paths and rejects private fields without controller value collisions", () => {
     const value = fixture();
     const cutoffMs = Date.parse("2026-09-06T12:00:00.000Z");
     const provenanceDirectory = join(value.root, "private-provenance");
@@ -279,17 +279,6 @@ describe("static export", () => {
       buildSnapshot: () => snapshot(cutoffMs),
     })).toThrow(/overlaps protected source/i);
 
-    const controller = "PRIVATE_CONTROLLER_SENTINEL";
-    value.store.writeBatch({
-      inputProvenance: [{
-        originKey: "ignored-by-store",
-        agent: "codex",
-        nativeSessionId: "session",
-        nativeInputId: "input",
-        origin: "human",
-        controller,
-      }],
-    });
     value.store.writeBatch({
       inputProvenance: [{
         originKey: "ignored-common-controller",
@@ -297,25 +286,39 @@ describe("static export", () => {
         nativeSessionId: "common-session",
         nativeInputId: "common-input",
         origin: "automated",
-        controller: "main",
+        controller: "codex",
       }],
     });
-    writeFileSync(join(value.assets, "styles.css"), ".main { display: block; }\n");
+    const valid = snapshot(cutoffMs);
+    valid.sources = [{
+      agent: "codex",
+      state: "available",
+      tokens: "recorded",
+      work: "recorded",
+      reasons: [],
+    }];
     expect(exportStaticSite(value.config, value.store, {
       outDir: join(value.root, "common-controller-export"),
       at: cutoffMs,
       assetsDir: value.assets,
-      buildSnapshot: () => snapshot(cutoffMs),
-    }).snapshot.organization).toBe("Komodo Risk Inc");
+      buildSnapshot: () => valid,
+    }).snapshot.sources[0]?.agent).toBe("codex");
 
-    const leaked = snapshot(cutoffMs);
-    leaked.organization = controller;
+    const forbidden = {
+      ...valid,
+      sources: [{
+        ...valid.sources[0]!,
+        controller: "private-controller",
+        nativeSessionId: "private-native-session",
+        nativeInputId: "private-native-input",
+      }],
+    };
     expect(() => exportStaticSite(value.config, value.store, {
       outDir: join(value.root, "controller-leak-export"),
       at: cutoffMs,
       assetsDir: value.assets,
-      buildSnapshot: () => leaked,
-    })).toThrow(/private controller/i);
+      buildSnapshot: () => forbidden as unknown as PublicSnapshot,
+    })).toThrow(/validation failed/i);
   });
 });
 
