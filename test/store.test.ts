@@ -104,12 +104,16 @@ describe("CollectorStore", () => {
         "input_native_evidence",
         "input_provenance",
         "input_source_state",
+        "schema_identity",
         "scope_evidence",
         "sessions",
         "sources",
         "usage",
         "work_intervals",
         "workspace_attributions",
+      ]);
+      expect(store.database.query("SELECT marker FROM schema_identity").all()).toEqual([
+        { marker: "vito-ledger-v3-final-input-provenance" },
       ]);
 
       const indexes = new Set((store.database.query(
@@ -228,6 +232,7 @@ describe("CollectorStore", () => {
     const first = CollectorStore.open(state);
     first.upsertUsage(usage(10), 1);
     first.database.exec(`
+      DROP TABLE schema_identity;
       DROP TABLE input_events;
       DROP TABLE input_native_evidence;
       DROP TABLE input_source_state;
@@ -244,6 +249,9 @@ describe("CollectorStore", () => {
       expect((migrated.database.query(
         "SELECT count(*) AS count FROM input_native_evidence",
       ).get() as { count: number }).count).toBe(0);
+      expect(migrated.database.query("SELECT marker FROM schema_identity").all()).toEqual([
+        { marker: "vito-ledger-v3-final-input-provenance" },
+      ]);
     } finally {
       migrated.close();
     }
@@ -270,6 +278,15 @@ describe("CollectorStore", () => {
     first.close();
 
     expect(() => CollectorStore.open(state)).toThrow(/schema 3 has malformed native input evidence.*rebuild/i);
+  });
+
+  test("rejects an unmarked otherwise-final version-three ledger", () => {
+    const state = temporaryState();
+    const first = CollectorStore.open(state);
+    first.database.exec("DELETE FROM schema_identity");
+    first.close();
+
+    expect(() => CollectorStore.open(state)).toThrow(/schema 3 is incomplete.*identity marker.*rebuild/i);
   });
 
   test("rolls facts and cursor/counter checkpoints back as one batch", () => {

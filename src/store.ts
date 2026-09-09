@@ -18,8 +18,15 @@ import {
 
 const SCHEMA_VERSION = 3;
 const DATABASE_FILENAME = "activity.sqlite";
+const SCHEMA_IDENTITY = "vito-ledger-v3-final-input-provenance";
 
 const schemaSql = `
+CREATE TABLE IF NOT EXISTS schema_identity (
+  marker TEXT PRIMARY KEY CHECK (marker = '${SCHEMA_IDENTITY}')
+) STRICT, WITHOUT ROWID;
+
+INSERT OR IGNORE INTO schema_identity (marker) VALUES ('${SCHEMA_IDENTITY}');
+
 CREATE TABLE IF NOT EXISTS sources (
   source_key TEXT PRIMARY KEY,
   agent TEXT NOT NULL,
@@ -296,6 +303,7 @@ const REQUIRED_SCHEMA_TABLES = [
   "input_native_evidence",
   "input_provenance",
   "input_source_state",
+  "schema_identity",
   "scope_evidence",
   "sessions",
   "sources",
@@ -303,6 +311,8 @@ const REQUIRED_SCHEMA_TABLES = [
   "work_intervals",
   "workspace_attributions",
 ] as const;
+
+const SCHEMA_IDENTITY_COLUMNS = ["marker"] as const;
 
 const INPUT_NATIVE_EVIDENCE_COLUMNS = [
   "origin_key",
@@ -319,6 +329,24 @@ function assertSchemaIntegrity(database: Database): void {
   if (missingTables.length > 0) {
     throw new Error(
       `Collector database schema ${SCHEMA_VERSION} is incomplete; rebuild required (missing tables: ${missingTables.join(", ")})`,
+    );
+  }
+
+  const schemaIdentityColumns = (database.query(
+    "PRAGMA table_info(schema_identity)",
+  ).all() as Array<{ name: string }>).map((row) => row.name);
+  if (
+    schemaIdentityColumns.length !== SCHEMA_IDENTITY_COLUMNS.length
+    || schemaIdentityColumns.some((column, index) => column !== SCHEMA_IDENTITY_COLUMNS[index])
+  ) {
+    throw new Error(
+      `Collector database schema ${SCHEMA_VERSION} has malformed schema identity; rebuild required`,
+    );
+  }
+  const schemaIdentities = database.query("SELECT marker FROM schema_identity").all() as Array<{ marker: string }>;
+  if (schemaIdentities.length !== 1 || schemaIdentities[0]?.marker !== SCHEMA_IDENTITY) {
+    throw new Error(
+      `Collector database schema ${SCHEMA_VERSION} is incomplete; final schema identity marker is missing; rebuild required`,
     );
   }
 
