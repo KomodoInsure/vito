@@ -7,9 +7,14 @@ import {
   publicSnapshotSchema,
   sanitizePublicLabel,
   type Agent,
+  type HumanCadenceCoverage,
+  type HumanCadenceStats,
+  type InputOrigin,
   type Metric,
   type PublicCost,
   type PublicDay,
+  type PublicInputGroup,
+  type PublicInputRange,
   type PublicReasonCode,
   type PublicSnapshot,
   type PublicScopeCoverage,
@@ -98,6 +103,30 @@ interface WorkRow {
   start_ms: number;
   end_ms: number;
   kind: WorkInterval["kind"];
+}
+
+interface InputRow {
+  origin_key: string;
+  source_key: string;
+  agent: Agent;
+  session_key: string;
+  at_ms: number | null;
+  kind: "submission" | "context" | "replay" | "unknown";
+  lane: "main" | "subagent" | "unknown";
+  origin: InputOrigin;
+  origin_evidence: "source" | "provenance" | "none" | "conflict";
+  quality: Quality;
+  reasons_json: string;
+  scope_decision: "included" | "out-of-scope" | "unattributed";
+}
+
+interface InputSourceStateRow {
+  source_key: string;
+  agent: Agent;
+  parser_version: number;
+  quality: Quality;
+  reasons_json: string;
+  last_successful_scan_ms: number | null;
 }
 
 interface ScopeEvidenceRow {
@@ -666,6 +695,319 @@ function usageRowsForDay(records: readonly UsageRecord[], evidenceByAgent: Reado
   });
 }
 
+
+const CADENCE_EXCLUSION_KEYS = ["inputHistory", "mixedScope", "unknownOrigin", "noHumanInput", "noRecordedWork"] as const;
+const INPUT_EXCLUSION_KEYS = ["context", "replayed", "unknownKind", "subagent", "unknownLane", "undated"] as const;
+
+function addSafe(left: number, right: number, label: string): number {
+  const value = left + right;
+  if (!Number.isSafeInteger(value) || value < 0) throw new RangeError(`${label} exceeds safe integer range`);
+  return value;
+}
+
+function emptyCadenceCoverage(): HumanCadenceCoverage {
+  return {
+    consideredSessions: 0,
+    excluded: { inputHistory: 0, mixedScope: 0, unknownOrigin: 0, noHumanInput: 0, noRecordedWork: 0 },
+  };
+}
+
+function emptyInputExclusions(): PublicInputGroup["excluded"] {
+  return { context: 0, replayed: 0, unknownKind: 0, subagent: 0, unknownLane: 0, undated: 0 };
+}
+
+function usableInputState(state: InputSourceStateRow | undefined): state is InputSourceStateRow {
+  return state !== undefined &&
+    state.parser_version === 1 &&
+    state.last_successful_scan_ms !== null &&
+    state.quality === "recorded";
+}
+
+function inputVolumeReasons(rows: readonly InputRow[], states: readonly InputSourceStateRow[], gap: boolean): PublicReasonCode[] {
+  const stateReasons = states.flatMap((state) => parseStringArray(state.reasons_json));
+  const rowReasons = rows.flatMap((row) => parseStringArray(row.reasons_json))
+    .filter((reason) => reason !== "input-origin-unknown" && reason !== "input-origin-conflict");
+  return fixedReasons(stateReasons, rowReasons, gap ? ["input-history-incomplete"] : []);
+}
+
+function countInputPopulation(rows: readonly InputRow[], startMs: number, cutoffMs: number): {
+  stats: { human: number; automated: number; unknown: number; activeSessions: number };
+  sessions: Map<string, InputRow[]>;
+  excluded: PublicInputGroup["excluded"];
+} {
+  const excluded = emptyInputExclusions();
+  const sessions = new Map<string, InputRow[]>();
+  let human = 0;
+  let automated = 0;
+  let unknown = 0;
+  for (const row of rows) {
+    if (row.scope_decision !== "included") continue;
+    if (row.at_ms === null) {
+      excluded.undated = addSafe(excluded.undated, 1, "Undated input count");
+      continue;
+    }
+    if (row.at_ms < startMs || row.at_ms > cutoffMs) continue;
+    if (row.kind === "context") {
+      excluded.context = addSafe(excluded.context, 1, "Context input count");
+      continue;
+    }
+    if (row.kind === "replay") {
+      excluded.replayed = addSafe(excluded.replayed, 1, "Replayed input count");
+      continue;
+    }
+    if (row.kind === "unknown") {
+      excluded.unknownKind = addSafe(excluded.unknownKind, 1, "Unknown-kind input count");
+      continue;
+    }
+    if (row.lane === "subagent") {
+      excluded.subagent = addSafe(excluded.subagent, 1, "Subagent input count");
+      continue;
+    }
+    if (row.lane === "unknown") {
+      excluded.unknownLane = addSafe(excluded.unknownLane, 1, "Unknown-lane input count");
+      continue;
+    }
+    if (row.origin === "human") human = addSafe(human, 1, "Human input count");
+    else if (row.origin === "automated") automated = addSafe(automated, 1, "Automated input count");
+    else unknown = addSafe(unknown, 1, "Unknown-origin input count");
+    const entries = sessions.get(row.session_key) ?? [];
+    entries.push(row);
+    sessions.set(row.session_key, entries);
+  }
+  return { stats: { human, automated, unknown, activeSessions: sessions.size }, sessions, excluded };
+}
+
+function inputGroupForAgent(
+  agent: Agent,
+  rows: readonly InputRow[],
+  states: readonly InputSourceStateRow[],
+  intervals: readonly WorkInterval[],
+  sourceRows: readonly SourceRow[],
+  startMs: number,
+  cutoffMs: number,
+): PublicInputGroup {
+  const includedRows = rows.filter((row) => row.scope_decision === "included");
+  const stateBySource = new Map(states.map((state) => [state.source_key, state]));
+  const hasSuccessfulScan = states.some((state) => state.parser_version === 1 && state.last_successful_scan_ms !== null);
+  const sourceGap = states.length === 0 || states.some((state) => !usableInputState(state));
+  const observationGap = includedRows.some((row) =>
+    row.quality !== "recorded" ||
+    row.kind === "unknown" ||
+    row.lane === "unknown" ||
+    row.at_ms === null && row.kind !== "context" && row.kind !== "replay"
+  );
+  const volumeGap = sourceGap || observationGap;
+  const population = countInputPopulation(rows, startMs, cutoffMs);
+  const hasRetainedObservations = includedRows.length > 0;
+  const inputs = !hasSuccessfulScan && !hasRetainedObservations
+    ? metric<typeof population.stats>(null, "unavailable", inputVolumeReasons(includedRows, states, true))
+    : metric(population.stats, volumeGap ? "partial" : "recorded", inputVolumeReasons(includedRows, states, volumeGap));
+
+  const cadenceCoverage = emptyCadenceCoverage();
+  cadenceCoverage.consideredSessions = population.sessions.size;
+  const workBySession = new Map<string, WorkInterval[]>();
+  for (const interval of intervals) {
+    if (interval.agent !== agent) continue;
+    const entries = workBySession.get(interval.sessionKey) ?? [];
+    entries.push(interval);
+    workBySession.set(interval.sessionKey, entries);
+  }
+  const rowsBySession = new Map<string, InputRow[]>();
+  for (const row of rows) {
+    const entries = rowsBySession.get(row.session_key) ?? [];
+    entries.push(row);
+    rowsBySession.set(row.session_key, entries);
+  }
+
+  let sessions = 0;
+  let humanInputs = 0;
+  const measuredIntervals: WorkInterval[] = [];
+  let hasOriginConflict = false;
+  for (const [sessionKey, counted] of population.sessions) {
+    const candidates = rowsBySession.get(sessionKey) ?? counted;
+    const inputHistory = candidates.some((row) => !usableInputState(stateBySource.get(row.source_key))) ||
+      candidates.some((row) => row.at_ms === null && row.kind !== "context" && row.kind !== "replay") ||
+      candidates.some((row) =>
+        row.at_ms !== null &&
+        row.at_ms >= startMs &&
+        row.at_ms <= cutoffMs &&
+        row.kind !== "context" &&
+        row.kind !== "replay" &&
+        (row.kind === "unknown" || row.lane === "unknown" || row.quality !== "recorded")
+      );
+    if (inputHistory) {
+      cadenceCoverage.excluded.inputHistory = addSafe(cadenceCoverage.excluded.inputHistory, 1, "Input-history exclusion count");
+      continue;
+    }
+    const mixedScope = candidates.some((row) =>
+      row.at_ms !== null &&
+      row.at_ms >= startMs &&
+      row.at_ms <= cutoffMs &&
+      row.kind !== "context" &&
+      row.kind !== "replay" &&
+      row.scope_decision !== "included"
+    );
+    if (mixedScope) {
+      cadenceCoverage.excluded.mixedScope = addSafe(cadenceCoverage.excluded.mixedScope, 1, "Mixed-scope exclusion count");
+      continue;
+    }
+    if (counted.some((row) => row.origin === "unknown")) {
+      cadenceCoverage.excluded.unknownOrigin = addSafe(cadenceCoverage.excluded.unknownOrigin, 1, "Unknown-origin exclusion count");
+      if (counted.some((row) => row.origin_evidence === "conflict")) hasOriginConflict = true;
+      continue;
+    }
+    const humans = counted.filter((row) => row.origin === "human");
+    if (humans.length === 0) {
+      cadenceCoverage.excluded.noHumanInput = addSafe(cadenceCoverage.excluded.noHumanInput, 1, "No-human-input exclusion count");
+      continue;
+    }
+    const firstHumanMs = Math.min(...humans.map((row) => row.at_ms!));
+    const clipped = (workBySession.get(sessionKey) ?? []).flatMap((interval) => {
+      const clippedStart = Math.max(firstHumanMs, interval.startMs);
+      const clippedEnd = Math.min(cutoffMs, interval.endMs);
+      return clippedEnd > clippedStart ? [{ ...interval, startMs: clippedStart, endMs: clippedEnd }] : [];
+    });
+    if (clipped.length === 0) {
+      cadenceCoverage.excluded.noRecordedWork = addSafe(cadenceCoverage.excluded.noRecordedWork, 1, "No-recorded-work exclusion count");
+      continue;
+    }
+    sessions = addSafe(sessions, 1, "Measured session count");
+    humanInputs = addSafe(humanInputs, humans.length, "Measured human input count");
+    measuredIntervals.push(...clipped);
+  }
+
+  const exclusionCount = Object.values(cadenceCoverage.excluded).reduce(
+    (sum, count) => addSafe(sum, count, "Cadence exclusion total"),
+    0,
+  );
+  const exclusionReasons = fixedReasons(
+    cadenceCoverage.excluded.inputHistory > 0 || cadenceCoverage.excluded.mixedScope > 0 ? ["input-history-incomplete"] : [],
+    cadenceCoverage.excluded.unknownOrigin > 0 ? ["input-origin-unknown"] : [],
+    hasOriginConflict ? ["input-origin-conflict"] : [],
+    cadenceCoverage.excluded.noRecordedWork > 0 ? ["timing-unavailable"] : [],
+  );
+  let cadence: Metric<HumanCadenceStats>;
+  if (sessions === 0) {
+    cadence = metric<HumanCadenceStats>(null, "unavailable", exclusionReasons);
+  } else {
+    const workEvidence = evidenceForSources(sourceRows.filter((row) => row.agent === agent), "work");
+    const measured = aggregateWorkIntervals(measuredIntervals, startMs, cutoffMs, {
+      status: workEvidence.status,
+      reasons: workEvidence.reasons,
+    });
+    const recordedWorkMs = measured.value?.agentMs ?? 0;
+    if (recordedWorkMs <= 0) throw new RangeError("Measured cadence must contain positive recorded work");
+    const partial = inputs.status !== "recorded" || measured.status !== "recorded" || exclusionCount > 0;
+    cadence = metric(
+      { sessions, humanInputs, recordedWorkMs },
+      partial ? "partial" : "recorded",
+      fixedReasons(measured.reasons, exclusionReasons, inputs.status === "recorded" ? [] : inputs.reasons),
+    );
+  }
+  return { inputs, cadence, cadenceCoverage, excluded: population.excluded };
+}
+
+function combineInputGroups(
+  entries: PublicInputRange["byHarness"],
+  enabled: ReadonlySet<Agent>,
+): PublicInputGroup {
+  const availableInputs = entries.flatMap((entry) => entry.group.inputs.value === null ? [] : [entry.group.inputs.value]);
+  const inputsValue = availableInputs.length === 0 ? null : availableInputs.reduce((total, value) => ({
+    human: addSafe(total.human, value.human, "All-harness human input count"),
+    automated: addSafe(total.automated, value.automated, "All-harness automated input count"),
+    unknown: addSafe(total.unknown, value.unknown, "All-harness unknown input count"),
+    activeSessions: addSafe(total.activeSessions, value.activeSessions, "All-harness active session count"),
+  }), { human: 0, automated: 0, unknown: 0, activeSessions: 0 });
+  const enabledInputGap = entries.some((entry) => enabled.has(entry.harness) && entry.group.inputs.status !== "recorded");
+  const inputPartial = entries.some((entry) => entry.group.inputs.value !== null && entry.group.inputs.status !== "recorded") || enabledInputGap;
+  const inputReasons = fixedReasons(...entries.map((entry) => entry.group.inputs.reasons));
+  const inputs = metric(inputsValue, inputsValue === null ? "unavailable" : inputPartial ? "partial" : "recorded", inputReasons);
+
+  const cadenceCoverage = emptyCadenceCoverage();
+  const excluded = emptyInputExclusions();
+  for (const entry of entries) {
+    cadenceCoverage.consideredSessions = addSafe(
+      cadenceCoverage.consideredSessions,
+      entry.group.cadenceCoverage.consideredSessions,
+      "All-harness considered session count",
+    );
+    for (const key of CADENCE_EXCLUSION_KEYS) {
+      cadenceCoverage.excluded[key] = addSafe(
+        cadenceCoverage.excluded[key],
+        entry.group.cadenceCoverage.excluded[key],
+        `All-harness ${key} exclusion count`,
+      );
+    }
+    for (const key of INPUT_EXCLUSION_KEYS) {
+      excluded[key] = addSafe(excluded[key], entry.group.excluded[key], `All-harness ${key} record count`);
+    }
+  }
+
+  const measured = entries.flatMap((entry) => entry.group.cadence.value === null ? [] : [entry.group.cadence.value]);
+  const cadenceValue = measured.length === 0 ? null : measured.reduce((total, value) => ({
+    sessions: addSafe(total.sessions, value.sessions, "All-harness measured session count"),
+    humanInputs: addSafe(total.humanInputs, value.humanInputs, "All-harness measured human input count"),
+    recordedWorkMs: addSafe(total.recordedWorkMs, value.recordedWorkMs, "All-harness recorded work"),
+  }), { sessions: 0, humanInputs: 0, recordedWorkMs: 0 });
+  const anyExclusion = Object.values(cadenceCoverage.excluded).some((count) => count > 0);
+  const cadencePartial = entries.some((entry) => entry.group.cadence.value !== null && entry.group.cadence.status !== "recorded") ||
+    enabledInputGap ||
+    anyExclusion;
+  const cadenceReasons = fixedReasons(
+    ...entries.map((entry) => entry.group.cadence.reasons),
+    ...entries.filter((entry) => enabled.has(entry.harness) && entry.group.inputs.status !== "recorded")
+      .map((entry) => entry.group.inputs.reasons),
+  );
+  const cadence = metric(
+    cadenceValue,
+    cadenceValue === null ? "unavailable" : cadencePartial ? "partial" : "recorded",
+    cadenceReasons,
+  );
+  return { inputs, cadence, cadenceCoverage, excluded };
+}
+
+function buildInputRanges(
+  inputRows: readonly InputRow[],
+  inputStates: readonly InputSourceStateRow[],
+  intervals: readonly WorkInterval[],
+  sourceRows: readonly SourceRow[],
+  cutoffDate: Temporal.PlainDate,
+  timezone: string,
+  cutoffMs: number,
+  enabledAgentsList: readonly Agent[],
+): PublicSnapshot["inputRanges"] {
+  const enabled = new Set(enabledAgentsList);
+  const ranges = {} as PublicSnapshot["inputRanges"];
+  for (const days of [7, 30, 90, 365] as const) {
+    const startDate = cutoffDate.subtract({ days: days - 1 });
+    const startMs = startDate.toZonedDateTime({
+      timeZone: timezone,
+      plainTime: Temporal.PlainTime.from("00:00"),
+    }).epochMilliseconds;
+    const rangeRows = inputRows.filter((row) => row.at_ms === null || row.at_ms >= startMs && row.at_ms <= cutoffMs);
+    const visible = new Set(enabledAgentsList);
+    for (const row of rangeRows) {
+      if (row.scope_decision === "included") visible.add(row.agent);
+    }
+    const byHarness = AGENTS.filter((agent) => visible.has(agent)).map((harness) => ({
+      harness,
+      group: inputGroupForAgent(
+        harness,
+        rangeRows.filter((row) => row.agent === harness),
+        inputStates.filter((state) => state.agent === harness),
+        intervals,
+        sourceRows,
+        startMs,
+        cutoffMs,
+      ),
+    }));
+    ranges[String(days) as keyof PublicSnapshot["inputRanges"]] = {
+      all: combineInputGroups(byHarness, enabled),
+      byHarness,
+    };
+  }
+  return ranges;
+}
 /** Read one consistent ledger snapshot and construct only the strict public allowlist. */
 export function buildPublicSnapshot(config: Config, store: CollectorStore, cutoffMs: number): PublicSnapshot {
   if (!Number.isSafeInteger(cutoffMs) || cutoffMs < 0) throw new TypeError("cutoffMs must be a nonnegative safe integer");
@@ -694,6 +1036,18 @@ export function buildPublicSnapshot(config: Config, store: CollectorStore, cutof
       WHERE scope_decision = 'included' AND end_ms > ? AND start_ms < ?
       ORDER BY start_ms, end_ms, origin_key
     `).all(periodStartMs, cutoffMs) as WorkRow[];
+    const inputRows = ledger.database.query(`
+      SELECT origin_key, source_key, agent, session_key, at_ms, kind, lane, origin, origin_evidence,
+             quality, reasons_json, scope_decision
+      FROM input_events
+      WHERE at_ms IS NULL OR (at_ms >= ? AND at_ms <= ?)
+      ORDER BY agent, session_key, at_ms, origin_key
+    `).all(periodStartMs, cutoffMs) as InputRow[];
+    const inputStates = ledger.database.query(`
+      SELECT source_key, agent, parser_version, quality, reasons_json, last_successful_scan_ms
+      FROM input_source_state
+      ORDER BY agent, source_key
+    `).all() as InputSourceStateRow[];
     const commitRows = ledger.database.query(`
       SELECT repository_key, oid, committer_ms, shallow FROM commits
       WHERE committer_ms >= ? AND committer_ms <= ? ORDER BY committer_ms, repository_key, oid
@@ -824,8 +1178,18 @@ export function buildPublicSnapshot(config: Config, store: CollectorStore, cutof
         : sourceRows.some((row) => row.state !== "available")
           ? "partial"
           : "recorded";
+    const inputRanges = buildInputRanges(
+      inputRows,
+      inputStates,
+      intervals,
+      sourceRows,
+      cutoffDate,
+      config.timezone,
+      cutoffMs,
+      agents,
+    );
     const snapshot: PublicSnapshot = {
-      schemaVersion: 3,
+      schemaVersion: 5,
       pricing: { ...PRICING_METADATA, sources: [...PRICING_METADATA.sources] },
       organization: config.companyName ?? "Komodo Risk Inc",
       timezone: config.timezone,
@@ -841,6 +1205,7 @@ export function buildPublicSnapshot(config: Config, store: CollectorStore, cutof
         scopeStatus,
         undated: scopeCoverage(undatedScopeRows),
       },
+      inputRanges,
       days,
     };
     return publicSnapshotSchema.parse(snapshot);

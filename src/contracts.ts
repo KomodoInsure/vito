@@ -147,6 +147,49 @@ export interface PublicWorkGroup {
   byHarness: Array<{ harness: Agent; work: Metric<WorkStats> }>;
 }
 
+export interface InputStats {
+  human: number;
+  automated: number;
+  unknown: number;
+  activeSessions: number;
+}
+
+export interface HumanCadenceStats {
+  sessions: number;
+  humanInputs: number;
+  recordedWorkMs: number;
+}
+
+export interface HumanCadenceCoverage {
+  consideredSessions: number;
+  excluded: {
+    inputHistory: number;
+    mixedScope: number;
+    unknownOrigin: number;
+    noHumanInput: number;
+    noRecordedWork: number;
+  };
+}
+
+export interface PublicInputGroup {
+  inputs: Metric<InputStats>;
+  cadence: Metric<HumanCadenceStats>;
+  cadenceCoverage: HumanCadenceCoverage;
+  excluded: {
+    context: number;
+    replayed: number;
+    unknownKind: number;
+    subagent: number;
+    unknownLane: number;
+    undated: number;
+  };
+}
+
+export interface PublicInputRange {
+  all: PublicInputGroup;
+  byHarness: Array<{ harness: Agent; group: PublicInputGroup }>;
+}
+
 export interface PublicScopeCount {
   records: number;
   knownTokens: number;
@@ -181,7 +224,7 @@ export interface PublicDay {
 }
 
 export interface PublicSnapshot {
-  schemaVersion: 3;
+  schemaVersion: 5;
   pricing: {
     asOf: string;
     basis: "standard-api";
@@ -213,6 +256,7 @@ export interface PublicSnapshot {
     scopeStatus: Quality;
     undated: PublicScopeCoverage;
   };
+  inputRanges: Record<"7" | "30" | "90" | "365", PublicInputRange>;
   days: PublicDay[];
 }
 
@@ -467,6 +511,191 @@ export const publicWorkGroupSchema = z
   })
   .strict();
 
+const inputStatsSchema = z
+  .object({
+    human: nonnegativeSafeIntegerSchema,
+    automated: nonnegativeSafeIntegerSchema,
+    unknown: nonnegativeSafeIntegerSchema,
+    activeSessions: nonnegativeSafeIntegerSchema,
+  })
+  .strict()
+  .superRefine((stats, context) => {
+    const total = stats.human + stats.automated + stats.unknown;
+    if (!Number.isSafeInteger(total)) {
+      context.addIssue({ code: "custom", message: "Input total must be a safe integer" });
+    } else if (total < stats.activeSessions) {
+      context.addIssue({ code: "custom", path: ["activeSessions"], message: "Active sessions cannot exceed counted inputs" });
+    }
+    if ((total === 0) !== (stats.activeSessions === 0)) {
+      context.addIssue({ code: "custom", path: ["activeSessions"], message: "Known-empty inputs and active sessions must be zero together" });
+    }
+  });
+
+const humanCadenceStatsSchema = z
+  .object({
+    sessions: nonnegativeSafeIntegerSchema,
+    humanInputs: nonnegativeSafeIntegerSchema,
+    recordedWorkMs: nonnegativeSafeIntegerSchema,
+  })
+  .strict()
+  .superRefine((stats, context) => {
+    if (stats.sessions === 0) {
+      context.addIssue({ code: "custom", path: ["sessions"], message: "Measured cadence requires a positive session count" });
+    }
+    if (stats.humanInputs < stats.sessions) {
+      context.addIssue({ code: "custom", path: ["humanInputs"], message: "Each measured session requires a human input" });
+    }
+    if (stats.recordedWorkMs === 0) {
+      context.addIssue({ code: "custom", path: ["recordedWorkMs"], message: "Measured cadence requires positive recorded work" });
+    }
+  });
+
+const inputMetricSchema = metricSchema(inputStatsSchema).superRefine((entry, context) => {
+  if (entry.value === null && entry.status !== "unavailable") {
+    context.addIssue({ code: "custom", path: ["status"], message: "Unavailable input data must use unavailable status" });
+  } else if (entry.value !== null && entry.status === "unavailable") {
+    context.addIssue({ code: "custom", path: ["status"], message: "Available input data cannot use unavailable status" });
+  }
+});
+
+const humanCadenceMetricSchema = metricSchema(humanCadenceStatsSchema).superRefine((entry, context) => {
+  if (entry.value === null && entry.status !== "unavailable") {
+    context.addIssue({ code: "custom", path: ["status"], message: "An empty cadence cohort must be unavailable" });
+  } else if (entry.value !== null && entry.status === "unavailable") {
+    context.addIssue({ code: "custom", path: ["status"], message: "A measured cadence cohort cannot be unavailable" });
+  }
+});
+
+const cadenceExcludedSchema = z
+  .object({
+    inputHistory: nonnegativeSafeIntegerSchema,
+    mixedScope: nonnegativeSafeIntegerSchema,
+    unknownOrigin: nonnegativeSafeIntegerSchema,
+    noHumanInput: nonnegativeSafeIntegerSchema,
+    noRecordedWork: nonnegativeSafeIntegerSchema,
+  })
+  .strict();
+
+const cadenceCoverageSchema = z
+  .object({
+    consideredSessions: nonnegativeSafeIntegerSchema,
+    excluded: cadenceExcludedSchema,
+  })
+  .strict();
+
+const inputExcludedSchema = z
+  .object({
+    context: nonnegativeSafeIntegerSchema,
+    replayed: nonnegativeSafeIntegerSchema,
+    unknownKind: nonnegativeSafeIntegerSchema,
+    subagent: nonnegativeSafeIntegerSchema,
+    unknownLane: nonnegativeSafeIntegerSchema,
+    undated: nonnegativeSafeIntegerSchema,
+  })
+  .strict();
+
+const publicInputGroupSchema = z
+  .object({
+    inputs: inputMetricSchema,
+    cadence: humanCadenceMetricSchema,
+    cadenceCoverage: cadenceCoverageSchema,
+    excluded: inputExcludedSchema,
+  })
+  .strict()
+  .superRefine((group, context) => {
+    const inputs = group.inputs.value;
+    const cadence = group.cadence.value;
+    if (group.cadenceCoverage.consideredSessions !== (inputs?.activeSessions ?? 0)) {
+      context.addIssue({ code: "custom", path: ["cadenceCoverage", "consideredSessions"], message: "Considered sessions must equal input-active sessions" });
+    }
+    const classified = (cadence?.sessions ?? 0) + Object.values(group.cadenceCoverage.excluded).reduce((sum, count) => sum + count, 0);
+    if (!Number.isSafeInteger(classified) || classified !== group.cadenceCoverage.consideredSessions) {
+      context.addIssue({ code: "custom", path: ["cadenceCoverage", "excluded"], message: "Every considered session must be classified exactly once" });
+    }
+    if (cadence !== null && (inputs === null || cadence.humanInputs > inputs.human || cadence.sessions > inputs.activeSessions)) {
+      context.addIssue({ code: "custom", path: ["cadence"], message: "Cadence cohort cannot exceed its supporting input population" });
+    }
+  });
+
+const publicInputHarnessSchema = z
+  .object({
+    harness: agentSchema,
+    group: publicInputGroupSchema,
+  })
+  .strict();
+
+const INPUT_COUNTER_KEYS = ["human", "automated", "unknown", "activeSessions"] as const;
+const CADENCE_COUNTER_KEYS = ["sessions", "humanInputs", "recordedWorkMs"] as const;
+const CADENCE_EXCLUDED_KEYS = ["inputHistory", "mixedScope", "unknownOrigin", "noHumanInput", "noRecordedWork"] as const;
+const INPUT_EXCLUDED_KEYS = ["context", "replayed", "unknownKind", "subagent", "unknownLane", "undated"] as const;
+
+function safeCounterSum(values: readonly number[]): number | null {
+  let total = 0;
+  for (const value of values) {
+    total += value;
+    if (!Number.isSafeInteger(total)) return null;
+  }
+  return total;
+}
+
+const publicInputRangeSchema = z
+  .object({
+    all: publicInputGroupSchema,
+    byHarness: z.array(publicInputHarnessSchema),
+  })
+  .strict()
+  .superRefine((range, context) => {
+    let previous = -1;
+    for (const [index, entry] of range.byHarness.entries()) {
+      const position = AGENTS.indexOf(entry.harness);
+      if (position <= previous) {
+        context.addIssue({ code: "custom", path: ["byHarness", index, "harness"], message: "Harness entries must be unique and follow AGENTS order" });
+      }
+      previous = position;
+    }
+
+    const availableInputs = range.byHarness.flatMap((entry) => entry.group.inputs.value === null ? [] : [entry.group.inputs.value]);
+    if ((range.all.inputs.value === null) !== (availableInputs.length === 0)) {
+      context.addIssue({ code: "custom", path: ["all", "inputs"], message: "All-harness inputs must sum available harness inputs" });
+    } else if (range.all.inputs.value !== null) {
+      for (const key of INPUT_COUNTER_KEYS) {
+        const total = safeCounterSum(availableInputs.map((value) => value[key]));
+        if (total === null || range.all.inputs.value[key] !== total) {
+          context.addIssue({ code: "custom", path: ["all", "inputs", "value", key], message: "All-harness inputs must sum available harness inputs" });
+        }
+      }
+    }
+
+    const availableCadence = range.byHarness.flatMap((entry) => entry.group.cadence.value === null ? [] : [entry.group.cadence.value]);
+    if ((range.all.cadence.value === null) !== (availableCadence.length === 0)) {
+      context.addIssue({ code: "custom", path: ["all", "cadence"], message: "All-harness cadence must sum measured harness cohorts" });
+    } else if (range.all.cadence.value !== null) {
+      for (const key of CADENCE_COUNTER_KEYS) {
+        const total = safeCounterSum(availableCadence.map((value) => value[key]));
+        if (total === null || range.all.cadence.value[key] !== total) {
+          context.addIssue({ code: "custom", path: ["all", "cadence", "value", key], message: "All-harness cadence must sum measured harness cohorts" });
+        }
+      }
+    }
+
+    const considered = safeCounterSum(range.byHarness.map((entry) => entry.group.cadenceCoverage.consideredSessions));
+    if (considered === null || range.all.cadenceCoverage.consideredSessions !== considered) {
+      context.addIssue({ code: "custom", path: ["all", "cadenceCoverage", "consideredSessions"], message: "All-harness coverage must sum harness coverage" });
+    }
+    for (const key of CADENCE_EXCLUDED_KEYS) {
+      const total = safeCounterSum(range.byHarness.map((entry) => entry.group.cadenceCoverage.excluded[key]));
+      if (total === null || range.all.cadenceCoverage.excluded[key] !== total) {
+        context.addIssue({ code: "custom", path: ["all", "cadenceCoverage", "excluded", key], message: "All-harness exclusions must sum harness exclusions" });
+      }
+    }
+    for (const key of INPUT_EXCLUDED_KEYS) {
+      const total = safeCounterSum(range.byHarness.map((entry) => entry.group.excluded[key]));
+      if (total === null || range.all.excluded[key] !== total) {
+        context.addIssue({ code: "custom", path: ["all", "excluded", key], message: "All-harness record exclusions must sum harness exclusions" });
+      }
+    }
+  });
+
 const publicUsageRowSchema = z
   .object({
     harness: agentSchema,
@@ -542,7 +771,7 @@ const publicSourceSchema = z
 
 export const publicSnapshotSchema: z.ZodType<PublicSnapshot> = z
   .object({
-    schemaVersion: z.literal(3),
+    schemaVersion: z.literal(5),
     pricing: z
       .object({
         asOf: publicDateSchema,
@@ -571,6 +800,14 @@ export const publicSnapshotSchema: z.ZodType<PublicSnapshot> = z
         excludedAmbiguousRecords: nonnegativeSafeIntegerSchema,
         scopeStatus: qualitySchema,
         undated: publicScopeCoverageSchema,
+      })
+      .strict(),
+    inputRanges: z
+      .object({
+        "7": publicInputRangeSchema,
+        "30": publicInputRangeSchema,
+        "90": publicInputRangeSchema,
+        "365": publicInputRangeSchema,
       })
       .strict(),
     days: z.array(publicDaySchema),

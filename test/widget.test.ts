@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { Agent, Metric, PublicCost, PublicDay, PublicSnapshot, PublicUsage, PublicWorkGroup, WorkStats } from "../src/contracts";
+import type { Agent, Metric, PublicCost, PublicDay, PublicInputGroup, PublicSnapshot, PublicUsage, PublicWorkGroup, WorkStats } from "../src/contracts";
 import {
   aggregateCost,
   aggregateResources,
@@ -9,6 +9,7 @@ import {
   isPublicSnapshot,
   inferenceStreaks,
   parseWidgetOptions,
+  renderInputs,
   SUPPORTED_VIEWS,
 } from "../web/widget";
 
@@ -71,6 +72,122 @@ function day(date: string, rows: PublicDay["usageRows"], companyUsage: PublicUsa
     commits,
     scope: { byHarness: [] },
   };
+}
+
+function inputGroup(
+  values: { human: number; automated: number; unknown: number; activeSessions: number } | null = {
+    human: 0,
+    automated: 0,
+    unknown: 0,
+    activeSessions: 0,
+  },
+  cadence: { sessions: number; humanInputs: number; recordedWorkMs: number } | null = null,
+  status: Metric<unknown>["status"] = values === null ? "unavailable" : "recorded",
+): PublicInputGroup {
+  const sessions = values?.activeSessions ?? 0;
+  const measured = cadence?.sessions ?? 0;
+  return {
+    inputs: { value: values, status, reasons: status === "partial" ? ["input-history-incomplete"] : [] },
+    cadence: {
+      value: cadence,
+      status: cadence === null ? "unavailable" : status,
+      reasons: cadence !== null && status === "partial" ? ["input-history-incomplete"] : [],
+    },
+    cadenceCoverage: {
+      consideredSessions: sessions,
+      excluded: {
+        inputHistory: sessions - measured,
+        mixedScope: 0,
+        unknownOrigin: 0,
+        noHumanInput: 0,
+        noRecordedWork: 0,
+      },
+    },
+    excluded: { context: 0, replayed: 0, unknownKind: 0, subagent: 0, unknownLane: 0, undated: 0 },
+  };
+}
+
+function inputRanges(group = inputGroup()): PublicSnapshot["inputRanges"] {
+  const range = () => ({ all: structuredClone(group), byHarness: [{ harness: "codex" as const, group: structuredClone(group) }] });
+  return { "7": range(), "30": range(), "90": range(), "365": range() };
+}
+
+function snapshotFixture(ranges: PublicSnapshot["inputRanges"] = inputRanges()): PublicSnapshot {
+  const unavailable = workGroup(unavailableWork());
+  return {
+    schemaVersion: 5,
+    pricing: { asOf: "2026-09-06", basis: "standard-api", sources: ["https://openai.com/api/pricing/"] },
+    organization: "Komodo Risk Inc",
+    timezone: "UTC",
+    generatedAt: "2026-09-06T12:00:00.000Z",
+    cutoff: "2026-09-06T12:00:00.000Z",
+    periodStart: "2026-09-06",
+    periodEnd: "2026-09-06",
+    collectionStatus: "ok",
+    sources: [],
+    coverage: {
+      unallocatedUsageRecords: 0,
+      excludedAmbiguousRecords: 0,
+      scopeStatus: "recorded",
+      undated: { byHarness: [] },
+    },
+    inputRanges: ranges,
+    days: [day("2026-09-06", [], usage(0), unavailable)],
+  };
+}
+
+class TestElement {
+  readonly tagName: string;
+  className = "";
+  dataset: Record<string, string> = {};
+  children: Array<TestElement | string> = [];
+  attributes: Record<string, string> = {};
+  private ownText = "";
+
+  constructor(tagName: string) {
+    this.tagName = tagName;
+  }
+
+  get textContent(): string {
+    return this.ownText + this.children.map((child) => typeof child === "string" ? child : child.textContent).join("");
+  }
+
+  set textContent(value: string) {
+    this.ownText = value;
+    this.children = [];
+  }
+
+  append(...children: Array<TestElement | string>): void {
+    this.children.push(...children);
+  }
+
+  setAttribute(name: string, value: string): void {
+    this.attributes[name] = value;
+  }
+}
+
+function renderInputText(snapshot: PublicSnapshot, range: 7 | 30 | 90 | 365, harness: Agent | "all"): string {
+  const previousDocument = globalThis.document;
+  Object.assign(globalThis, {
+    document: {
+      createElement(tag: string) {
+        return new TestElement(tag);
+      },
+    },
+  });
+  try {
+    const rendered = renderInputs(snapshot, {
+      options: { view: "all", range, theme: "auto", harness },
+      grouping: "model",
+      rhythmMetric: "active",
+      resource: { provider: "ignored-provider", model: "ignored-model" },
+      hiddenSeries: new Set(),
+      chartMounts: [],
+    } as never) as unknown as TestElement;
+    return rendered.textContent;
+  } finally {
+    Object.assign(globalThis, { document: previousDocument });
+  }
 }
 
 function row(harness: Agent, provider: string, model: string, total: number, parts: Partial<Record<keyof PublicUsage, number>> = {}): PublicDay["usageRows"][number] {
@@ -222,28 +339,82 @@ describe("widget aggregates", () => {
   });
 });
 
+
+describe("human input cadence panel", () => {
+  test("renders the selected precomputed cohort, neutral explanation, and complete disclosure", () => {
+    const codex = inputGroup(
+      { human: 3, automated: 9, unknown: 1, activeSessions: 3 },
+      { sessions: 2, humanInputs: 3, recordedWorkMs: 1_200_000 },
+      "partial",
+    );
+    codex.cadenceCoverage.excluded.inputHistory = 0;
+    codex.cadenceCoverage.excluded.unknownOrigin = 1;
+    const claude = inputGroup({ human: 1, automated: 0, unknown: 0, activeSessions: 1 }, null, "partial");
+    claude.cadenceCoverage.excluded.inputHistory = 0;
+    claude.cadenceCoverage.excluded.noRecordedWork = 1;
+    claude.cadence.reasons = ["timing-unavailable"];
+    const all = inputGroup(
+      { human: 4, automated: 9, unknown: 1, activeSessions: 4 },
+      { sessions: 2, humanInputs: 3, recordedWorkMs: 1_200_000 },
+      "partial",
+    );
+    all.cadenceCoverage.excluded.inputHistory = 0;
+    all.cadenceCoverage.excluded.unknownOrigin = 1;
+    all.cadenceCoverage.excluded.noRecordedWork = 1;
+    all.excluded.context = 1;
+    const thirty = inputGroup(
+      { human: 2, automated: 0, unknown: 0, activeSessions: 1 },
+      { sessions: 1, humanInputs: 2, recordedWorkMs: 600_000 },
+    );
+    const ranges: PublicSnapshot["inputRanges"] = {
+      "7": { all, byHarness: [{ harness: "codex", group: codex }, { harness: "claude", group: claude }] },
+      "30": { all: thirty, byHarness: [{ harness: "codex", group: thirty }] },
+      "90": { all: structuredClone(thirty), byHarness: [{ harness: "codex", group: structuredClone(thirty) }] },
+      "365": { all: structuredClone(thirty), byHarness: [{ harness: "codex", group: structuredClone(thirty) }] },
+    };
+    const snapshot = snapshotFixture(ranges);
+    snapshot.sources = [
+      { agent: "codex", state: "available", tokens: "recorded", work: "recorded", reasons: [] },
+      { agent: "claude", state: "available", tokens: "recorded", work: "unavailable", reasons: ["timing-unavailable"] },
+    ];
+
+    const sevenDayAll = renderInputText(snapshot, 7, "all");
+    for (const text of [
+      "Human inputs / measured session",
+      "Recorded work / human input",
+      "1.5",
+      "6.67 min",
+      "3 human inputs · 2 measured sessions · 20 min recorded work",
+      "2 of 4 input-active sessions included",
+      "All inputs / active session",
+      "3.5",
+      "4 human · 9 automated · 1 unknown",
+      "Origin identified",
+      "92.9%",
+      "Partial cadence",
+      "Fewer human inputs and more recorded work per input can indicate less frequent human direction. They do not prove successful or autonomous work.",
+      "Both cards use the same measured sessions. Initial requests count; unknown origins and sessions without recorded timing are excluded, not treated as zero.",
+      "Selected period, not lifetime. Resuming a native session keeps one session; a new native ID counts separately. Work before the first human input in this period is excluded.",
+      "Timing coverage varies by tool. Recorded work is not total session age, uninterrupted runtime, productive work, or a complete-session timing guarantee.",
+      "Unknown origin1",
+      "No recorded work1",
+      "Context1",
+      "claude",
+      "Unavailable",
+    ]) expect(sevenDayAll).toContain(text);
+
+    const thirtyDayCodex = renderInputText(snapshot, 30, "codex");
+    expect(thirtyDayCodex).toContain("2 human inputs · 1 measured session · 10 min recorded work");
+    expect(thirtyDayCodex).toContain("5 min");
+
+    const claudeOnly = renderInputText(snapshot, 7, "claude");
+    expect(claudeOnly).toContain("—");
+    expect(claudeOnly).toContain("1 human · 0 automated · 0 unknown");
+  });
+});
 describe("public DOM safety boundary", () => {
   test("strictly rejects unknown nested keys", () => {
-    const unavailable = workGroup(unavailableWork());
-    const fixture: PublicSnapshot = {
-      schemaVersion: 3,
-      pricing: { asOf: "2026-09-06", basis: "standard-api", sources: ["https://openai.com/api/pricing/"] },
-      organization: "Komodo Risk Inc",
-      timezone: "UTC",
-      generatedAt: "2026-09-06T12:00:00.000Z",
-      cutoff: "2026-09-06T12:00:00.000Z",
-      periodStart: "2026-09-06",
-      periodEnd: "2026-09-06",
-      collectionStatus: "ok",
-      sources: [],
-      coverage: {
-        unallocatedUsageRecords: 0,
-        excludedAmbiguousRecords: 0,
-        scopeStatus: "recorded",
-        undated: { byHarness: [] },
-      },
-      days: [day("2026-09-06", [], usage(0), unavailable)],
-    };
+    const fixture = snapshotFixture();
     expect(isPublicSnapshot(fixture)).toBe(true);
     expect(isPublicSnapshot({ ...fixture, organization: "Komodo" })).toBe(true);
     expect(isPublicSnapshot({ ...fixture, organization: " " })).toBe(false);
@@ -259,6 +430,34 @@ describe("public DOM safety boundary", () => {
     const unsafe = structuredClone(fixture) as PublicSnapshot & { days: Array<PublicDay & { repository: string }> };
     unsafe.days[0]!.repository = "/private/repository";
     expect(isPublicSnapshot(unsafe)).toBe(false);
+    const missingRange = structuredClone(fixture) as PublicSnapshot & { inputRanges: Record<string, unknown> };
+    delete missingRange.inputRanges["90"];
+    expect(isPublicSnapshot(missingRange)).toBe(false);
+    const inconsistent = structuredClone(fixture);
+    inconsistent.inputRanges["7"].all.inputs.value = { human: 0, automated: 0, unknown: 0, activeSessions: 1 };
+    expect(isPublicSnapshot(inconsistent)).toBe(false);
+    const privateInput = structuredClone(fixture) as PublicSnapshot & { inputRanges: { "7": { all: PublicInputGroup & { controller: string } } } };
+    const unsafeInput = structuredClone(fixture);
+    unsafeInput.inputRanges["7"].all.excluded.context = Number.MAX_SAFE_INTEGER + 1;
+    expect(isPublicSnapshot(unsafeInput)).toBe(false);
+    const positiveWithoutCohort = structuredClone(fixture);
+    positiveWithoutCohort.inputRanges["7"].all.cadence = {
+      value: { sessions: 0, humanInputs: 1, recordedWorkMs: 1 },
+      status: "recorded",
+      reasons: [],
+    };
+    expect(isPublicSnapshot(positiveWithoutCohort)).toBe(false);
+    const aggregateMismatch = structuredClone(fixture);
+    aggregateMismatch.inputRanges["7"].all.excluded.context = 1;
+    expect(isPublicSnapshot(aggregateMismatch)).toBe(false);
+    const duplicateHarness = structuredClone(fixture);
+    duplicateHarness.inputRanges["7"].byHarness.push({
+      harness: "codex",
+      group: inputGroup(),
+    });
+    expect(isPublicSnapshot(duplicateHarness)).toBe(false);
+    privateInput.inputRanges["7"].all.controller = "private-controller";
+    expect(isPublicSnapshot(privateInput)).toBe(false);
   });
 
 });

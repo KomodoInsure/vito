@@ -19,7 +19,7 @@ import {
   loadConfig,
   validateOutputPath,
 } from "../src/config";
-import { publicSnapshotSchema, sanitizePublicLabel } from "../src/contracts";
+import { publicSnapshotSchema, sanitizePublicLabel, type PublicSnapshot } from "../src/contracts";
 import { PRICING_METADATA } from "../src/pricing";
 
 const temporaryDirectories: string[] = [];
@@ -295,8 +295,26 @@ describe("configuration initialization", () => {
 });
 
 describe("public contract safety", () => {
+  const emptyInputGroup = () => ({
+    inputs: {
+      value: { human: 0, automated: 0, unknown: 0, activeSessions: 0 },
+      status: "recorded" as const,
+      reasons: [],
+    },
+    cadence: { value: null, status: "unavailable" as const, reasons: [] },
+    cadenceCoverage: {
+      consideredSessions: 0,
+      excluded: { inputHistory: 0, mixedScope: 0, unknownOrigin: 0, noHumanInput: 0, noRecordedWork: 0 },
+    },
+    excluded: { context: 0, replayed: 0, unknownKind: 0, subagent: 0, unknownLane: 0, undated: 0 },
+  });
+  const emptyInputRange = () => ({
+    all: emptyInputGroup(),
+    byHarness: [{ harness: "codex" as const, group: emptyInputGroup() }],
+  });
+
   const snapshot = {
-    schemaVersion: 3 as const,
+    schemaVersion: 5 as const,
     pricing: { ...PRICING_METADATA, sources: [...PRICING_METADATA.sources] },
     organization: "Komodo Risk Inc" as const,
     timezone: "UTC",
@@ -320,8 +338,64 @@ describe("public contract safety", () => {
       scopeStatus: "recorded" as const,
       undated: { byHarness: [] },
     },
+    inputRanges: {
+      "7": emptyInputRange(),
+      "30": emptyInputRange(),
+      "90": emptyInputRange(),
+      "365": emptyInputRange(),
+    },
     days: [],
   };
+
+  test("accepts only schema 5 with all exact input ranges", () => {
+    expect(publicSnapshotSchema.safeParse(snapshot).success).toBe(true);
+    const missing = structuredClone(snapshot) as Record<string, unknown>;
+    delete (missing.inputRanges as Record<string, unknown>)["90"];
+    expect(publicSnapshotSchema.safeParse(missing).success).toBe(false);
+    const extra = structuredClone(snapshot);
+    (extra.inputRanges as Record<string, unknown>)["14"] = emptyInputRange();
+    expect(publicSnapshotSchema.safeParse(extra).success).toBe(false);
+    expect(publicSnapshotSchema.safeParse({ ...snapshot, schemaVersion: 3 }).success).toBe(false);
+  });
+
+  test("rejects inconsistent or private input aggregates", () => {
+    const privateValue = structuredClone(snapshot) as typeof snapshot & {
+      inputRanges: { "7": { all: Record<string, unknown> } };
+    };
+    (privateValue.inputRanges["7"].all as Record<string, unknown>).controller = "private-controller";
+    expect(publicSnapshotSchema.safeParse(privateValue).success).toBe(false);
+
+    const inconsistent = structuredClone(snapshot);
+    inconsistent.inputRanges["7"].all.inputs.value = { human: 0, automated: 0, unknown: 0, activeSessions: 1 };
+    expect(publicSnapshotSchema.safeParse(inconsistent).success).toBe(false);
+
+    const unsafe = structuredClone(snapshot);
+    unsafe.inputRanges["7"].all.excluded.context = Number.MAX_SAFE_INTEGER + 1;
+    expect(publicSnapshotSchema.safeParse(unsafe).success).toBe(false);
+
+    const positiveWithoutCohort = structuredClone(snapshot) as unknown as PublicSnapshot;
+    positiveWithoutCohort.inputRanges["7"].all.cadence = {
+      value: { sessions: 0, humanInputs: 1, recordedWorkMs: 1 },
+      status: "recorded",
+      reasons: [],
+    };
+    expect(publicSnapshotSchema.safeParse(positiveWithoutCohort).success).toBe(false);
+
+    const coverageMismatch = structuredClone(snapshot);
+    coverageMismatch.inputRanges["7"].all.cadenceCoverage.excluded.noRecordedWork = 1;
+    expect(publicSnapshotSchema.safeParse(coverageMismatch).success).toBe(false);
+
+    const aggregateMismatch = structuredClone(snapshot);
+    aggregateMismatch.inputRanges["7"].all.excluded.context = 1;
+    expect(publicSnapshotSchema.safeParse(aggregateMismatch).success).toBe(false);
+
+    const duplicateHarness = structuredClone(snapshot);
+    duplicateHarness.inputRanges["7"].byHarness.push({
+      harness: "codex",
+      group: emptyInputGroup(),
+    });
+    expect(publicSnapshotSchema.safeParse(duplicateHarness).success).toBe(false);
+  });
 
   test("rejects private extras and unknown nested fields", () => {
     expect(publicSnapshotSchema.safeParse({ ...snapshot, schemaVersion: 1 }).success).toBe(false);

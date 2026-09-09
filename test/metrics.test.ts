@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { Config } from "../src/config";
-import { publicSnapshotSchema, type Agent, type UsageRecord, type WorkInterval } from "../src/contracts";
+import { publicSnapshotSchema, type Agent, type InputRecord, type Quality, type UsageRecord, type WorkInterval } from "../src/contracts";
 import { aggregateUsageRecords, aggregateWorkIntervals, buildHourlySlots, buildPublicSnapshot } from "../src/metrics";
 import { CollectorStore } from "../src/store";
 
@@ -90,6 +90,57 @@ function installCodexSource(store: CollectorStore, workQuality: "recorded" | "pa
       reasons: workQuality === "recorded" ? [] : ["timing-unavailable"],
     }],
   });
+}
+
+type ScopedInput = InputRecord & {
+  scopeDecision: "included" | "out-of-scope" | "unattributed";
+  scopeReason: string;
+};
+
+function input(
+  originKey: string,
+  sessionKey: string,
+  atMs: number | null,
+  overrides: Partial<ScopedInput> = {},
+): ScopedInput {
+  return {
+    originKey,
+    sourceKey: "codex:synthetic-private-source",
+    agent: "codex",
+    sessionKey,
+    nativeSessionId: `native-${sessionKey}`,
+    nativeInputId: `native-${originKey}`,
+    workspaceKey: "/private/workspace-sentinel",
+    repositoryKey: "/private/repository-sentinel",
+    atMs,
+    kind: "submission",
+    lane: "main",
+    controller: "private-controller-sentinel",
+    origin: "human",
+    originEvidence: "source",
+    quality: "recorded",
+    reasons: [],
+    scopeDecision: "included",
+    scopeReason: "configured-root",
+    ...overrides,
+  };
+}
+
+function installInputState(
+  store: CollectorStore,
+  sourceKey = "codex:synthetic-private-source",
+  agent: Agent = "codex",
+  quality: Quality = "recorded",
+): void {
+  store.writeBatch({ inputSourceStates: [{
+    sourceKey,
+    agent,
+    parserVersion: 1,
+    quality,
+    reasons: quality === "recorded" ? [] : ["input-history-incomplete"],
+    scannedAtMs: Date.parse("2026-09-09T12:00:00Z"),
+    lastSuccessfulScanMs: Date.parse("2026-09-09T12:00:00Z"),
+  }] });
 }
 
 afterEach(() => {
@@ -491,6 +542,220 @@ describe("public snapshot", () => {
       });
       expect(snapshot.days.at(-1)?.usage.total.value).toBe(10);
       expect(snapshot.coverage.scopeStatus).toBe("recorded");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("uses one cadence cohort with mutually exclusive session exclusions", () => {
+    const store = temporaryStore();
+    try {
+      const cutoff = Date.parse("2026-09-09T12:00:00Z");
+      const at = Date.parse("2026-09-08T12:00:00Z");
+      installCodexSource(store);
+      installInputState(store);
+      store.writeBatch({
+        inputs: [
+          input("eligible-human-one", "eligible", at),
+          input("eligible-human-two", "eligible", at + 300_000),
+          input("eligible-auto", "eligible", at + 420_000, { origin: "automated", originEvidence: "source" }),
+          input("history-human", "history", at, { quality: "partial", reasons: ["input-history-incomplete"] }),
+          input("history-out", "history", at + 1, { scopeDecision: "out-of-scope", scopeReason: "outside-configured-scope" }),
+          input("mixed-human", "mixed", at),
+          input("mixed-out", "mixed", at + 1, { origin: "automated", originEvidence: "source", scopeDecision: "unattributed", scopeReason: "attribution-unavailable" }),
+          input("unknown", "unknown", at, { origin: "unknown", originEvidence: "none" }),
+          input("automated", "automated", at, { origin: "automated", originEvidence: "source" }),
+          input("no-work", "no-work", at),
+        ],
+        workIntervals: [
+          interval("before", "codex", "eligible", at - 600_000, at),
+          interval("eligible-work", "codex", "eligible", at, at + 600_000),
+          interval("eligible-overlap", "codex", "eligible", at + 120_000, at + 480_000),
+          interval("child-lane", "codex", "eligible:child", at, at + 7_200_000),
+          interval("unknown-work", "codex", "unknown", at, at + 7_200_000),
+          interval("history-work", "codex", "history", at, at + 600_000),
+          interval("mixed-work", "codex", "mixed", at, at + 600_000),
+          interval("automated-work", "codex", "automated", at, at + 600_000),
+        ],
+      });
+
+      const group = buildPublicSnapshot(config(store.stateDir), store, cutoff).inputRanges["7"].all;
+      expect(group.inputs).toMatchObject({
+        value: { human: 5, automated: 2, unknown: 1, activeSessions: 6 },
+        status: "partial",
+      });
+      expect(group.cadence).toEqual({
+        value: { sessions: 1, humanInputs: 2, recordedWorkMs: 600_000 },
+        status: "partial",
+        reasons: ["input-history-incomplete", "input-origin-unknown", "timing-unavailable"],
+      });
+      expect(group.cadenceCoverage).toEqual({
+        consideredSessions: 6,
+        excluded: { inputHistory: 1, mixedScope: 1, unknownOrigin: 1, noHumanInput: 1, noRecordedWork: 1 },
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  test("unions each native session lane and sums concurrent eligible session work", () => {
+    const store = temporaryStore();
+    try {
+      const cutoff = Date.parse("2026-09-09T12:00:00Z");
+      const at = Date.parse("2026-09-08T12:00:00Z");
+      installCodexSource(store);
+      installInputState(store);
+      store.writeBatch({
+        inputs: [
+          input("a-human", "session-a", at),
+          input("b-human-one", "session-b", at),
+          input("b-human-two", "session-b", at + 60_000),
+        ],
+        workIntervals: [
+          interval("a-work", "codex", "session-a", at, at + 600_000),
+          interval("a-overlap", "codex", "session-a", at + 120_000, at + 480_000),
+          interval("b-work", "codex", "session-b", at, at + 600_000),
+        ],
+      });
+
+      expect(buildPublicSnapshot(config(store.stateDir), store, cutoff).inputRanges["7"].all).toMatchObject({
+        inputs: { value: { human: 3, automated: 0, unknown: 0, activeSessions: 2 }, status: "recorded" },
+        cadence: {
+          value: { sessions: 2, humanInputs: 3, recordedWorkMs: 1_200_000 },
+          status: "recorded",
+          reasons: [],
+        },
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  test("recomputes whole native sessions for each selected local-date window", () => {
+    const store = temporaryStore();
+    try {
+      const cutoff = Date.parse("2026-09-09T12:00:00Z");
+      const recent = Date.parse("2026-09-08T12:00:00Z");
+      installCodexSource(store);
+      installInputState(store);
+      store.writeBatch({
+        inputs: [
+          input("older-unknown", "resumed-session", Date.parse("2026-08-25T12:00:00Z"), { origin: "unknown", originEvidence: "none" }),
+          input("recent-human", "resumed-session", recent),
+        ],
+        workIntervals: [interval("recent-work", "codex", "resumed-session", recent, recent + 600_000)],
+      });
+
+      const ranges = buildPublicSnapshot(config(store.stateDir), store, cutoff).inputRanges;
+      expect(ranges["7"].all).toMatchObject({
+        inputs: { value: { human: 1, automated: 0, unknown: 0, activeSessions: 1 } },
+        cadence: { value: { sessions: 1, humanInputs: 1, recordedWorkMs: 600_000 } },
+      });
+      expect(ranges["30"].all).toMatchObject({
+        inputs: { value: { human: 1, automated: 0, unknown: 1, activeSessions: 1 } },
+        cadence: { value: null, status: "unavailable", reasons: ["input-origin-unknown"] },
+        cadenceCoverage: {
+          consideredSessions: 1,
+          excluded: { inputHistory: 0, mixedScope: 0, unknownOrigin: 1, noHumanInput: 0, noRecordedWork: 0 },
+        },
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  test("uses timezone-local range starts across daylight-saving changes", () => {
+    const store = temporaryStore();
+    try {
+      const cutoff = Date.parse("2026-03-10T12:00:00Z");
+      const localStart = Date.parse("2026-03-04T08:00:00Z");
+      installCodexSource(store);
+      installInputState(store);
+      store.writeBatch({
+        inputs: [
+          input("outside", "local-session", localStart - 1),
+          input("boundary", "local-session", localStart),
+          input("recent", "local-session", Date.parse("2026-03-09T12:00:00Z")),
+        ],
+        workIntervals: [interval("local-work", "codex", "local-session", localStart, localStart + 600_000)],
+      });
+
+      const group = buildPublicSnapshot(config(store.stateDir, "America/Los_Angeles"), store, cutoff).inputRanges["7"].all;
+      expect(group.inputs.value).toEqual({ human: 2, automated: 0, unknown: 0, activeSessions: 1 });
+      expect(group.cadence.value).toEqual({ sessions: 1, humanInputs: 2, recordedWorkMs: 600_000 });
+    } finally {
+      store.close();
+    }
+  });
+
+  test("keeps known-empty supporting input counts but makes empty and automated-only cadence unavailable", () => {
+    const store = temporaryStore();
+    try {
+      const cutoff = Date.parse("2026-09-09T12:00:00Z");
+      installCodexSource(store);
+      installInputState(store);
+      const empty = buildPublicSnapshot(config(store.stateDir), store, cutoff).inputRanges["7"].all;
+      expect(empty.inputs).toEqual({
+        value: { human: 0, automated: 0, unknown: 0, activeSessions: 0 },
+        status: "recorded",
+        reasons: [],
+      });
+      expect(empty.cadence).toEqual({ value: null, status: "unavailable", reasons: [] });
+
+      store.writeBatch({ inputs: [
+        input("automated-only", "automated-session", Date.parse("2026-09-08T12:00:00Z"), {
+          origin: "automated",
+          originEvidence: "source",
+        }),
+      ] });
+      const automated = buildPublicSnapshot(config(store.stateDir), store, cutoff).inputRanges["7"].all;
+      expect(automated.inputs.value).toEqual({ human: 0, automated: 1, unknown: 0, activeSessions: 1 });
+      expect(automated.cadence).toEqual({ value: null, status: "unavailable", reasons: [] });
+      expect(automated.cadenceCoverage.excluded.noHumanInput).toBe(1);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("uses excluded-record priority and exposes retained input-only harnesses", () => {
+    const store = temporaryStore();
+    try {
+      const cutoff = Date.parse("2026-09-09T12:00:00Z");
+      const at = Date.parse("2026-09-08T12:00:00Z");
+      installCodexSource(store);
+      installInputState(store);
+      installInputState(store, "claude:retained-source", "claude");
+      const claude = (originKey: string, overrides: Partial<ScopedInput> = {}) => input(originKey, "claude-session", at, {
+        agent: "claude",
+        sourceKey: "claude:retained-source",
+        ...overrides,
+      });
+      store.writeBatch({ inputs: [
+        claude("counted"),
+        claude("context", { kind: "context", lane: "subagent" }),
+        claude("replay", { kind: "replay", lane: "unknown" }),
+        claude("unknown-kind", { kind: "unknown", lane: "subagent" }),
+        claude("subagent", { lane: "subagent" }),
+        claude("unknown-lane", { lane: "unknown" }),
+        claude("undated-context", { atMs: null, kind: "context" }),
+      ] });
+
+      const range = buildPublicSnapshot(config(store.stateDir), store, cutoff).inputRanges["7"];
+      expect(range.byHarness.map((entry) => entry.harness)).toEqual(["codex", "claude"]);
+      expect(range.byHarness[1]?.group).toMatchObject({
+        inputs: {
+          value: { human: 1, automated: 0, unknown: 0, activeSessions: 1 },
+          status: "partial",
+        },
+        cadence: { value: null, status: "unavailable", reasons: ["input-history-incomplete"] },
+        cadenceCoverage: {
+          consideredSessions: 1,
+          excluded: { inputHistory: 1, mixedScope: 0, unknownOrigin: 0, noHumanInput: 0, noRecordedWork: 0 },
+        },
+        excluded: { context: 1, replayed: 1, unknownKind: 1, subagent: 1, unknownLane: 1, undated: 1 },
+      });
+      expect(range.all.inputs.value).toEqual({ human: 1, automated: 0, unknown: 0, activeSessions: 1 });
+      expect(range.all.excluded).toEqual({ context: 1, replayed: 1, unknownKind: 1, subagent: 1, unknownLane: 1, undated: 1 });
     } finally {
       store.close();
     }

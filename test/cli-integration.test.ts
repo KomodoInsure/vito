@@ -57,8 +57,18 @@ function gitCollectionResult(): GitCollectionResult {
 }
 
 function publicSnapshot(at: string): PublicSnapshot {
+  const group = () => ({
+    inputs: { value: null, status: "unavailable" as const, reasons: ["input-history-incomplete" as const] },
+    cadence: { value: null, status: "unavailable" as const, reasons: [] },
+    cadenceCoverage: {
+      consideredSessions: 0,
+      excluded: { inputHistory: 0, mixedScope: 0, unknownOrigin: 0, noHumanInput: 0, noRecordedWork: 0 },
+    },
+    excluded: { context: 0, replayed: 0, unknownKind: 0, subagent: 0, unknownLane: 0, undated: 0 },
+  });
+  const range = () => ({ all: group(), byHarness: [] });
   return {
-    schemaVersion: 3,
+    schemaVersion: 5,
     pricing: { ...PRICING_METADATA, sources: [...PRICING_METADATA.sources] },
     organization: "Komodo Risk Inc",
     timezone: "UTC",
@@ -74,6 +84,7 @@ function publicSnapshot(at: string): PublicSnapshot {
       scopeStatus: "recorded",
       undated: { byHarness: [] },
     },
+    inputRanges: { "7": range(), "30": range(), "90": range(), "365": range() },
     days: [],
   };
 }

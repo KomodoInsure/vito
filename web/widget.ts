@@ -9,6 +9,8 @@ import type {
   PublicCost,
   PublicDay,
   PublicSnapshot,
+  PublicInputGroup,
+  PublicInputRange,
   PublicUsage,
   PublicWorkGroup,
   Quality,
@@ -49,6 +51,10 @@ const PUBLIC_REASON_VALUES = [
   "open-interval",
   "unattributed-session",
   "stale-ref",
+  "input-history-incomplete",
+  "input-kind-unknown",
+  "input-origin-conflict",
+  "input-origin-unknown",
 ] as const;
 const PUBLIC_SOURCE_STATES = [
   "available",
@@ -214,6 +220,118 @@ function isWorkGroup(value: unknown): value is PublicWorkGroup {
   );
 }
 
+const INPUT_COUNTER_KEYS = ["human", "automated", "unknown", "activeSessions"] as const;
+const CADENCE_COUNTER_KEYS = ["sessions", "humanInputs", "recordedWorkMs"] as const;
+const CADENCE_EXCLUDED_KEYS = ["inputHistory", "mixedScope", "unknownOrigin", "noHumanInput", "noRecordedWork"] as const;
+const INPUT_EXCLUDED_KEYS = ["context", "replayed", "unknownKind", "subagent", "unknownLane", "undated"] as const;
+
+function safeCountSum(values: readonly number[]): number | null {
+  let total = 0;
+  for (const value of values) {
+    total += value;
+    if (!Number.isSafeInteger(total)) return null;
+  }
+  return total;
+}
+
+function isInputStats(value: unknown): boolean {
+  if (!isObject(value) || !hasOnlyKeys(value, INPUT_COUNTER_KEYS) || !INPUT_COUNTER_KEYS.every((key) => isCount(value[key]))) return false;
+  const total = safeCountSum([value.human as number, value.automated as number, value.unknown as number]);
+  return total !== null &&
+    total >= (value.activeSessions as number) &&
+    ((total === 0) === ((value.activeSessions as number) === 0));
+}
+
+function isCadenceStats(value: unknown): boolean {
+  return isObject(value) &&
+    hasOnlyKeys(value, CADENCE_COUNTER_KEYS) &&
+    CADENCE_COUNTER_KEYS.every((key) => isCount(value[key])) &&
+    (value.sessions as number) > 0 &&
+    (value.humanInputs as number) >= (value.sessions as number) &&
+    (value.recordedWorkMs as number) > 0;
+}
+
+function isCounterObject(value: unknown, keys: readonly string[]): value is Record<string, number> {
+  return isObject(value) && hasOnlyKeys(value, keys) && keys.every((key) => isCount(value[key]));
+}
+
+function isInputGroup(value: unknown): value is PublicInputGroup {
+  if (
+    !isObject(value) ||
+    !hasOnlyKeys(value, ["inputs", "cadence", "cadenceCoverage", "excluded"]) ||
+    !isMetric(value.inputs, isInputStats) ||
+    !isMetric(value.cadence, isCadenceStats) ||
+    !isObject(value.cadenceCoverage) ||
+    !hasOnlyKeys(value.cadenceCoverage, ["consideredSessions", "excluded"]) ||
+    !isCount(value.cadenceCoverage.consideredSessions) ||
+    !isCounterObject(value.cadenceCoverage.excluded, CADENCE_EXCLUDED_KEYS) ||
+    !isCounterObject(value.excluded, INPUT_EXCLUDED_KEYS)
+  ) return false;
+  if ((value.inputs.value === null) !== (value.inputs.status === "unavailable")) return false;
+  if ((value.cadence.value === null) !== (value.cadence.status === "unavailable")) return false;
+  const inputs = value.inputs.value as Record<string, number> | null;
+  const cadence = value.cadence.value as Record<string, number> | null;
+  const considered = value.cadenceCoverage.consideredSessions;
+  if (considered !== (inputs?.activeSessions ?? 0)) return false;
+  const excluded = value.cadenceCoverage.excluded;
+  const classified = safeCountSum([
+    cadence?.sessions ?? 0,
+    ...CADENCE_EXCLUDED_KEYS.map((key) => excluded[key]!),
+  ]);
+  if (classified === null || classified !== considered) return false;
+  return cadence === null || inputs !== null &&
+    cadence.humanInputs! <= inputs.human! &&
+    cadence.sessions! <= inputs.activeSessions!;
+}
+
+function inputRangeCountersMatch(range: PublicInputRange): boolean {
+  const availableInputs = range.byHarness.flatMap((entry) => entry.group.inputs.value === null ? [] : [entry.group.inputs.value]);
+  if ((range.all.inputs.value === null) !== (availableInputs.length === 0)) return false;
+  if (range.all.inputs.value !== null) {
+    for (const key of INPUT_COUNTER_KEYS) {
+      if (range.all.inputs.value[key] !== safeCountSum(availableInputs.map((value) => value[key]))) return false;
+    }
+  }
+  const availableCadence = range.byHarness.flatMap((entry) => entry.group.cadence.value === null ? [] : [entry.group.cadence.value]);
+  if ((range.all.cadence.value === null) !== (availableCadence.length === 0)) return false;
+  if (range.all.cadence.value !== null) {
+    for (const key of CADENCE_COUNTER_KEYS) {
+      if (range.all.cadence.value[key] !== safeCountSum(availableCadence.map((value) => value[key]))) return false;
+    }
+  }
+  if (range.all.cadenceCoverage.consideredSessions !== safeCountSum(range.byHarness.map((entry) => entry.group.cadenceCoverage.consideredSessions))) return false;
+  for (const key of CADENCE_EXCLUDED_KEYS) {
+    if (range.all.cadenceCoverage.excluded[key] !== safeCountSum(range.byHarness.map((entry) => entry.group.cadenceCoverage.excluded[key]))) return false;
+  }
+  for (const key of INPUT_EXCLUDED_KEYS) {
+    if (range.all.excluded[key] !== safeCountSum(range.byHarness.map((entry) => entry.group.excluded[key]))) return false;
+  }
+  return true;
+}
+
+function isInputRange(value: unknown): value is PublicInputRange {
+  if (
+    !isObject(value) ||
+    !hasOnlyKeys(value, ["all", "byHarness"]) ||
+    !isInputGroup(value.all) ||
+    !Array.isArray(value.byHarness)
+  ) return false;
+  let previous = -1;
+  for (const entry of value.byHarness) {
+    if (!isObject(entry) || !hasOnlyKeys(entry, ["harness", "group"]) || !AGENT_VALUES.includes(entry.harness as Agent) || !isInputGroup(entry.group)) return false;
+    const position = AGENT_VALUES.indexOf(entry.harness as Agent);
+    if (position <= previous) return false;
+    previous = position;
+  }
+  return inputRangeCountersMatch(value as PublicInputRange);
+}
+
+function isInputRanges(value: unknown): value is PublicSnapshot["inputRanges"] {
+  return isObject(value) &&
+    hasOnlyKeys(value, ["7", "30", "90", "365"]) &&
+    ["7", "30", "90", "365"].every((range) => isInputRange(value[range]));
+}
+
 function isScopeCount(value: unknown): boolean {
   return isObject(value) &&
     hasOnlyKeys(value, ["records", "knownTokens", "unknownTotalRecords"]) &&
@@ -255,9 +373,9 @@ function isDay(value: unknown): value is PublicDay {
 }
 
 export function isPublicSnapshot(value: unknown): value is PublicSnapshot {
-  if (!isObject(value) || !hasOnlyKeys(value, ["schemaVersion", "pricing", "organization", "timezone", "generatedAt", "cutoff", "periodStart", "periodEnd", "collectionStatus", "sources", "coverage", "days"])) return false;
+  if (!isObject(value) || !hasOnlyKeys(value, ["schemaVersion", "pricing", "organization", "timezone", "generatedAt", "cutoff", "periodStart", "periodEnd", "collectionStatus", "sources", "coverage", "inputRanges", "days"])) return false;
   return (
-    value.schemaVersion === 3 &&
+    value.schemaVersion === 5 &&
     typeof value.organization === "string" && value.organization.length >= 1 && value.organization.length <= 80 &&
     value.organization.trim() === value.organization &&
     isObject(value.pricing) && hasOnlyKeys(value.pricing, ["asOf", "basis", "sources"]) &&
@@ -279,6 +397,7 @@ export function isPublicSnapshot(value: unknown): value is PublicSnapshot {
     isCount(value.coverage.excludedAmbiguousRecords) &&
     isQuality(value.coverage.scopeStatus) &&
     isScopeCoverage(value.coverage.undated) &&
+    isInputRanges(value.inputRanges) &&
     Array.isArray(value.days) && value.days.every(isDay)
   );
 }
@@ -693,6 +812,9 @@ function enabledHarnesses(snapshot: PublicSnapshot): Agent[] {
     for (const row of day.usageRows) fromData.add(row.harness);
     for (const row of day.work.byHarness) fromData.add(row.harness);
   }
+  for (const range of Object.values(snapshot.inputRanges)) {
+    for (const entry of range.byHarness) fromData.add(entry.harness);
+  }
   return AGENT_VALUES.filter((agent) => fromData.has(agent) || snapshot.sources.some((source) => source.agent === agent && source.state !== "not-found"));
 }
 
@@ -960,6 +1082,173 @@ function renderCards(days: PublicDay[], state: RenderState, view: WidgetView): H
     "Share of recorded active wall-clock time with two or more agents active. Idle and unavailable time are excluded.",
   ));
   return cards;
+}
+
+export function renderInputs(snapshot: PublicSnapshot, state: RenderState): HTMLElement {
+  const rangeKey = String(state.options.range) as keyof PublicSnapshot["inputRanges"];
+  const range: PublicInputRange = snapshot.inputRanges[rangeKey];
+  const group = state.options.harness === "all"
+    ? range.all
+    : range.byHarness.find((entry) => entry.harness === state.options.harness)?.group;
+  if (group === undefined) throw new TypeError("Selected harness is missing input-range data");
+
+  const cadence = group.cadence.value;
+  const inputs = group.inputs.value;
+  const humanInputsPerSession = cadence === null ? null : cadence.humanInputs / cadence.sessions;
+  const recordedMinutesPerInput = cadence === null ? null : cadence.recordedWorkMs / 60_000 / cadence.humanInputs;
+  const countedInputs = inputs === null ? 0 : inputs.human + inputs.automated + inputs.unknown;
+  const inputsPerSession = inputs === null || inputs.activeSessions === 0 ? null : countedInputs / inputs.activeSessions;
+  const identifiedOrigin = inputs === null || countedInputs === 0 ? null : (inputs.human + inputs.automated) / countedInputs;
+  const panel = createPanel(
+    "Human direction cadence",
+    "Recorded input frequency and work timing for one matched cohort in the selected period.",
+  );
+  const cadenceCards = element("section", "input-cadence-cards");
+  cadenceCards.setAttribute("aria-label", "Human cadence summary");
+  cadenceCards.append(
+    renderMetricCard(
+      "Human inputs / measured session",
+      humanInputsPerSession === null ? "—" : formatDecimal.format(humanInputsPerSession),
+      "Initial requests are included",
+      "Recorded human submissions divided by measured native sessions in the shared eligible cohort.",
+    ),
+    renderMetricCard(
+      "Recorded work / human input",
+      recordedMinutesPerInput === null ? "—" : `${formatDecimal.format(recordedMinutesPerInput)} min`,
+      "Recorded minutes, not elapsed session age",
+      "Recorded native-session working time after the first in-period human input, divided by human inputs in the same measured cohort.",
+    ),
+  );
+  if (group.cadence.status === "partial") {
+    panel.body.append(element("p", "input-status input-status-partial", "Partial cadence"));
+  } else if (group.cadence.status === "unavailable") {
+    panel.body.append(element("p", "input-status", "Cadence unavailable"));
+  }
+  panel.body.append(cadenceCards);
+
+  const measuredSessions = cadence?.sessions ?? 0;
+  const measuredHumanInputs = cadence?.humanInputs ?? 0;
+  const recordedMinutes = cadence === null ? null : cadence.recordedWorkMs / 60_000;
+  panel.body.append(
+    element(
+      "p",
+      "cadence-totals",
+      cadence === null
+        ? "— human inputs · — measured sessions · — recorded work"
+        : `${formatInteger.format(measuredHumanInputs)} human inputs · ${formatInteger.format(measuredSessions)} measured ${measuredSessions === 1 ? "session" : "sessions"} · ${formatDecimal.format(recordedMinutes!)} min recorded work`,
+    ),
+    element(
+      "p",
+      "cadence-coverage",
+      `${formatInteger.format(measuredSessions)} of ${formatInteger.format(group.cadenceCoverage.consideredSessions)} input-active sessions included`,
+    ),
+  );
+
+  const supporting = element("section", "input-support-grid");
+  supporting.setAttribute("aria-label", "Supporting input counts");
+  const frequency = element("article", "input-support-item");
+  frequency.append(
+    element("h3", undefined, "All inputs / active session"),
+    element("strong", undefined, inputsPerSession === null ? "—" : formatDecimal.format(inputsPerSession)),
+  );
+  const origins = element("article", "input-support-item");
+  origins.append(
+    element("h3", undefined, "Counted input origins"),
+    element(
+      "strong",
+      undefined,
+      inputs === null
+        ? "— human · — automated · — unknown"
+        : `${formatInteger.format(inputs.human)} human · ${formatInteger.format(inputs.automated)} automated · ${formatInteger.format(inputs.unknown)} unknown`,
+    ),
+  );
+  const coverage = element("article", "input-support-item");
+  coverage.append(
+    element("h3", undefined, "Origin identified"),
+    element("strong", undefined, identifiedOrigin === null ? "—" : formatPercent.format(identifiedOrigin)),
+    element("span", undefined, "of counted inputs"),
+  );
+  supporting.append(frequency, origins, coverage);
+  panel.body.append(
+    supporting,
+    element("p", "panel-note input-explanation", "Fewer human inputs and more recorded work per input can indicate less frequent human direction. They do not prove successful or autonomous work."),
+    element("p", "panel-note", "Both cards use the same measured sessions. Initial requests count; unknown origins and sessions without recorded timing are excluded, not treated as zero."),
+    element("p", "panel-note", "Selected period, not lifetime. Resuming a native session keeps one session; a new native ID counts separately. Work before the first human input in this period is excluded."),
+    element("p", "panel-note", "Timing coverage varies by tool. Recorded work is not total session age, uninterrupted runtime, productive work, or a complete-session timing guarantee."),
+  );
+
+  const disclosure = element("details", "data-disclosure input-disclosure");
+  disclosure.append(element("summary", undefined, "Input and timing coverage"));
+  const exclusionsWrap = element("div", "table-wrap");
+  const exclusionsTable = element("table");
+  exclusionsTable.append(element("caption", "sr-only", "Sessions excluded from the human cadence cohort"));
+  const exclusionsHead = element("thead");
+  const exclusionsHeader = element("tr");
+  for (const label of ["Session exclusion", "Sessions"]) exclusionsHeader.append(element("th", undefined, label));
+  exclusionsHead.append(exclusionsHeader);
+  const exclusionsBody = element("tbody");
+  const sessionExclusions: Array<[string, number]> = [
+    ["Input history", group.cadenceCoverage.excluded.inputHistory],
+    ["Mixed scope", group.cadenceCoverage.excluded.mixedScope],
+    ["Unknown origin", group.cadenceCoverage.excluded.unknownOrigin],
+    ["No human input", group.cadenceCoverage.excluded.noHumanInput],
+    ["No recorded work", group.cadenceCoverage.excluded.noRecordedWork],
+  ];
+  for (const [label, count] of sessionExclusions) {
+    const row = element("tr");
+    row.append(element("td", undefined, label), element("td", undefined, formatInteger.format(count)));
+    exclusionsBody.append(row);
+  }
+  exclusionsTable.append(exclusionsHead, exclusionsBody);
+  exclusionsWrap.append(exclusionsTable);
+
+  const recordsWrap = element("div", "table-wrap");
+  const recordsTable = element("table");
+  recordsTable.append(element("caption", "sr-only", "Input records excluded from supporting counts"));
+  const recordsHead = element("thead");
+  const recordsHeader = element("tr");
+  for (const label of ["Record exclusion", "Records"]) recordsHeader.append(element("th", undefined, label));
+  recordsHead.append(recordsHeader);
+  const recordsBody = element("tbody");
+  const recordExclusions: Array<[string, number]> = [
+    ["Context", group.excluded.context],
+    ["Replayed", group.excluded.replayed],
+    ["Unknown kind", group.excluded.unknownKind],
+    ["Subagent", group.excluded.subagent],
+    ["Unknown lane", group.excluded.unknownLane],
+    ["Undated", group.excluded.undated],
+  ];
+  for (const [label, count] of recordExclusions) {
+    const row = element("tr");
+    row.append(element("td", undefined, label), element("td", undefined, formatInteger.format(count)));
+    recordsBody.append(row);
+  }
+  recordsTable.append(recordsHead, recordsBody);
+  recordsWrap.append(recordsTable);
+
+  const sourcesWrap = element("div", "table-wrap");
+  const sourcesTable = element("table");
+  sourcesTable.append(element("caption", "sr-only", "Per-harness input and recorded-work timing status"));
+  const sourcesHead = element("thead");
+  const sourcesHeader = element("tr");
+  for (const label of ["Harness", "Input status", "Timing status"]) sourcesHeader.append(element("th", undefined, label));
+  sourcesHead.append(sourcesHeader);
+  const sourcesBody = element("tbody");
+  for (const entry of range.byHarness) {
+    const timing = snapshot.sources.find((source) => source.agent === entry.harness)?.work ?? "unavailable";
+    const row = element("tr");
+    row.append(
+      element("td", undefined, entry.harness),
+      element("td", undefined, entry.group.inputs.status[0]!.toUpperCase() + entry.group.inputs.status.slice(1)),
+      element("td", undefined, timing[0]!.toUpperCase() + timing.slice(1)),
+    );
+    sourcesBody.append(row);
+  }
+  sourcesTable.append(sourcesHead, sourcesBody);
+  sourcesWrap.append(sourcesTable);
+  disclosure.append(exclusionsWrap, recordsWrap, sourcesWrap);
+  panel.body.append(disclosure);
+  return panel.root;
 }
 
 
@@ -1358,6 +1647,7 @@ export function renderDashboard(root: HTMLElement, snapshot: PublicSnapshot, ini
     dashboard.dataset.harness = state.options.harness;
     dashboard.append(renderToolbar(snapshot, state, draw));
     if (["all", "uptime", "concurrency", "agent-hours"].includes(state.options.view)) dashboard.append(renderCards(days, state, state.options.view));
+    if (state.options.view === "all") dashboard.append(renderInputs(snapshot, state));
     if (shouldRender(state.options.view, "calendar")) dashboard.append(renderCalendar(days, state, false));
     if (state.options.view === "commits") dashboard.append(renderCalendar(days, state, true));
     if (shouldRender(state.options.view, "models")) dashboard.append(renderModels(days, state, draw));
