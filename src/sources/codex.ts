@@ -1029,7 +1029,10 @@ export const codexAdapter: SourceAdapter = {
     let unallocatedUsageRecords = 0;
 
     for (const path of inventory.jsonl) {
-      if (probeHeader(path) !== "recognized") continue;
+      if (probeHeader(path) !== "recognized") {
+        inputReasons.add("input-history-incomplete");
+        continue;
+      }
       const sourceKey = `codex:file:${hash(resolve(path))}`;
       const makeNormalizer = () => new CodexNormalizer({
         sourceKey,

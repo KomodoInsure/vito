@@ -598,6 +598,39 @@ describe("public snapshot", () => {
     }
   });
 
+
+  test("does not admit cadence from a partial aggregate input source state", () => {
+    const store = temporaryStore();
+    try {
+      const cutoff = Date.parse("2026-09-09T12:00:00Z");
+      const at = Date.parse("2026-09-08T12:00:00Z");
+      installCodexSource(store);
+      installInputState(store, "codex", "codex", "partial");
+      store.writeBatch({
+        inputs: [input("aggregate-partial-human", "aggregate-partial", at, { sourceKey: "codex" })],
+        workIntervals: [interval("aggregate-partial-work", "codex", "aggregate-partial", at, at + 600_000)],
+      });
+
+      const group = buildPublicSnapshot(config(store.stateDir), store, cutoff).inputRanges["7"].all;
+      expect(group.inputs).toMatchObject({
+        value: { human: 1, automated: 0, unknown: 0, activeSessions: 1 },
+        status: "partial",
+        reasons: ["input-history-incomplete"],
+      });
+      expect(group.cadence).toEqual({
+        value: null,
+        status: "unavailable",
+        reasons: ["input-history-incomplete"],
+      });
+      expect(group.cadenceCoverage).toEqual({
+        consideredSessions: 1,
+        excluded: { inputHistory: 1, mixedScope: 0, unknownOrigin: 0, noHumanInput: 0, noRecordedWork: 0 },
+      });
+    } finally {
+      store.close();
+    }
+  });
+
   test("unions each native session lane and sums concurrent eligible session work", () => {
     const store = temporaryStore();
     try {

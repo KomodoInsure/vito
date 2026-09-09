@@ -603,4 +603,68 @@ describe("Codex adapter collection", () => {
       rmSync(temporary, { recursive: true, force: true });
     }
   });
+
+  test("keeps aggregate input coverage partial when a previously scanned partition becomes unsupported", async () => {
+    const temporary = mkdtempSync(join(tmpdir(), "vito-codex-partition-state-"));
+    const sourceRoot = join(temporary, "codex");
+    const stateDir = join(temporary, "state");
+    const firstPath = join(sourceRoot, "rollout-first.jsonl");
+    const secondPath = join(sourceRoot, "rollout-second.jsonl");
+    mkdirSync(sourceRoot);
+    writeFileSync(firstPath, jsonl([
+      header({ id: "partition-first" }),
+      userInput("partition-first-input", ["user.text"], 1),
+    ]));
+    writeFileSync(secondPath, jsonl([
+      header({ id: "partition-second" }),
+      userInput("partition-second-input", ["user.text"], 1),
+    ]));
+    const config: Config = {
+      version: 1,
+      workspaceRoots: ["/synthetic/workspace"],
+      timezone: "UTC",
+      stateDir,
+      sources: { codex: [sourceRoot] },
+      repositories: [],
+      publication: { repository: "synthetic/activity", branch: "main" },
+    };
+    const store = CollectorStore.open(stateDir);
+    try {
+      const first = await codexAdapter.collect({
+        config,
+        store,
+        rebuild: false,
+        cutoffMs: BASE + 10_000,
+        reconcileAll: false,
+      });
+      expect(first.inputSourceState).toMatchObject({
+        quality: "recorded",
+        reasons: [],
+        lastSuccessfulScanMs: BASE + 10_000,
+      });
+      store.writeBatch({
+        inputSourceStates: [first.inputSourceState],
+        fileCursors: first.fileCursors,
+      });
+
+      writeFileSync(secondPath, jsonl([
+        header({ id: "partition-second", version: 2 }),
+      ]));
+      const second = await codexAdapter.collect({
+        config,
+        store,
+        rebuild: false,
+        cutoffMs: BASE + 20_000,
+        reconcileAll: false,
+      });
+      expect(second.inputSourceState).toMatchObject({
+        quality: "partial",
+        reasons: ["input-history-incomplete"],
+        lastSuccessfulScanMs: BASE + 10_000,
+      });
+    } finally {
+      store.close();
+      rmSync(temporary, { recursive: true, force: true });
+    }
+  });
 });
