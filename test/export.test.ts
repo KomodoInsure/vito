@@ -290,6 +290,24 @@ describe("static export", () => {
         controller,
       }],
     });
+    value.store.writeBatch({
+      inputProvenance: [{
+        originKey: "ignored-common-controller",
+        agent: "codex",
+        nativeSessionId: "common-session",
+        nativeInputId: "common-input",
+        origin: "automated",
+        controller: "main",
+      }],
+    });
+    writeFileSync(join(value.assets, "styles.css"), ".main { display: block; }\n");
+    expect(exportStaticSite(value.config, value.store, {
+      outDir: join(value.root, "common-controller-export"),
+      at: cutoffMs,
+      assetsDir: value.assets,
+      buildSnapshot: () => snapshot(cutoffMs),
+    }).snapshot.organization).toBe("Komodo Risk Inc");
+
     const leaked = snapshot(cutoffMs);
     leaked.organization = controller;
     expect(() => exportStaticSite(value.config, value.store, {
@@ -297,7 +315,7 @@ describe("static export", () => {
       at: cutoffMs,
       assetsDir: value.assets,
       buildSnapshot: () => leaked,
-    })).toThrow(/private configured path/i);
+    })).toThrow(/private controller/i);
   });
 });
 

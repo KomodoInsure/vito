@@ -101,6 +101,7 @@ describe("CollectorStore", () => {
         "counter_snapshots",
         "file_cursors",
         "input_events",
+        "input_native_evidence",
         "input_provenance",
         "input_source_state",
         "scope_evidence",

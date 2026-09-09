@@ -471,7 +471,10 @@ describe("Pages publisher", () => {
       async request(method, path, body) {
         if (!mutated) {
           mutated = true;
-          appendFileSync(join(value.state, "export", "styles.css"), `\\n${controller}\\n`);
+          const activityPath = join(value.state, "export", "activity.json");
+          const leaked = publicSnapshotSchema.parse(JSON.parse(readFileSync(activityPath, "utf8")));
+          leaked.organization = controller;
+          writeFileSync(activityPath, `${JSON.stringify(leaked, null, 2)}\n`);
         }
         return value.pages.request(method, path, body);
       },
@@ -481,7 +484,7 @@ describe("Pages publisher", () => {
       at: CUTOFF,
       transport,
       git: defaultGitTransport,
-    })).rejects.toThrow(/private configured path/i);
+    })).rejects.toThrow(/private controller/i);
     expect(readdirSync(join(value.remote, "refs", "heads"))).toEqual([]);
   }, 30_000);
   test("requires an existing public dedicated repository and preserves unrelated destinations", async () => {

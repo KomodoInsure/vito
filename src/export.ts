@@ -253,7 +253,6 @@ function privateStrings(config: Config, store: CollectorStore): string[] {
     ...(config.historicalWorkspaces ?? []).map((workspace) => workspace.path),
     ...Object.values(config.sources).flatMap((paths) => paths ?? []),
     ...(config.inputProvenance ?? []),
-    ...store.listInputControllers(),
   ].filter((value, index, values) => value.length > 1 && values.indexOf(value) === index);
 }
 
@@ -262,6 +261,24 @@ function assertNoPrivateStrings(content: string, privateValues: readonly string[
     if (content.includes(value) || content.includes(JSON.stringify(value).slice(1, -1))) {
       fail("Public snapshot contains a private configured path");
     }
+  }
+}
+
+function assertNoPrivateControllerValues(value: unknown, controllers: readonly string[]): void {
+  if (controllers.length === 0) return;
+  const protectedControllers = new Set(controllers);
+  const pending: unknown[] = [value];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (typeof current === "string") {
+      if (protectedControllers.has(current)) fail("Public snapshot contains a private controller value");
+      continue;
+    }
+    if (Array.isArray(current)) {
+      pending.push(...current);
+      continue;
+    }
+    if (typeof current === "object" && current !== null) pending.push(...Object.values(current));
   }
 }
 
@@ -285,6 +302,9 @@ function stageExport(
   writeFileSync(join(stagingDirectory, ".nojekyll"), "", { encoding: "utf8", flag: "wx", mode: 0o644 });
   chmodSync(join(stagingDirectory, ".nojekyll"), 0o644);
   const privateValues = privateStrings(config, store);
+  // activity.json is the only asset assembled from runtime/config data; every
+  // other export asset is copied unchanged from the built asset directory.
+  assertNoPrivateControllerValues(snapshot, store.listInputControllers());
   const serialized = `${JSON.stringify(snapshot, null, 2)}\n`;
   assertNoPrivateStrings(serialized, privateValues);
   writeFileSync(join(stagingDirectory, "activity.json"), serialized, { encoding: "utf8", flag: "wx", mode: 0o644 });

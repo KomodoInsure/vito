@@ -209,6 +209,65 @@ describe("input provenance collection", () => {
     expect(storedInput(value, "input-conflict")).toMatchObject({ origin: "unknown", origin_evidence: "conflict" });
   });
 
+  test("restores explicit native source evidence when a conflicted tuple later becomes ambiguous", async () => {
+    const value = fixture();
+    value.store.writeBatch({ inputs: [input("native-source", "transition", {
+      origin: "human",
+      originEvidence: "source",
+      controller: "native-controller",
+    })] });
+    writeLines(value.provenance, [event("transition", "automated", "feed-controller")]);
+    await collectInputProvenance(value.config, value.store, { rebuild: false, cutoffMs: CUTOFF });
+    expect(storedInput(value, "native-source")).toMatchObject({
+      origin: "unknown",
+      origin_evidence: "conflict",
+      controller: null,
+    });
+
+    value.store.writeBatch({ inputs: [input("other-partition", "transition", {
+      sourceKey: "codex:other-partition",
+      sessionKey: "other-session",
+    })] });
+    expect(await collectInputProvenance(
+      { ...value.config, inputProvenance: [] },
+      value.store,
+      { rebuild: false, cutoffMs: CUTOFF },
+    )).toEqual({ "input-provenance-ambiguous": 1 });
+    expect(storedInput(value, "native-source")).toMatchObject({
+      origin: "human",
+      origin_evidence: "source",
+      controller: "native-controller",
+      reasons_json: "[]",
+    });
+  });
+
+  test("keeps native/feed controller disagreement null across repeated reconciliation", async () => {
+    const value = fixture();
+    value.store.writeBatch({ inputs: [input("controller-disagreement", "controller-disagreement", {
+      controller: "native-controller",
+    })] });
+    writeLines(value.provenance, [
+      event("controller-disagreement", "human", "feed-controller"),
+    ]);
+
+    await collectInputProvenance(value.config, value.store, { rebuild: false, cutoffMs: CUTOFF });
+    expect(storedInput(value, "controller-disagreement")).toMatchObject({
+      origin: "human",
+      origin_evidence: "provenance",
+      controller: null,
+    });
+    await collectInputProvenance(
+      { ...value.config, inputProvenance: [] },
+      value.store,
+      { rebuild: false, cutoffMs: CUTOFF },
+    );
+    expect(storedInput(value, "controller-disagreement")).toMatchObject({
+      origin: "human",
+      origin_evidence: "provenance",
+      controller: null,
+    });
+  });
+
   test("retains an early claim through feed deletion and reconciles it after the native input arrives", async () => {
     const value = fixture();
     writeLines(value.provenance, [event("late", "human", "early-controller")]);

@@ -196,7 +196,7 @@ function assertMarker(path: string): void {
   parseMarker(readFileSync(path, "utf8"));
 }
 
-function privateStrings(config: Config, controllers: readonly string[]): string[] {
+function privateStrings(config: Config): string[] {
   return [
     config.stateDir,
     join(config.stateDir, "activity.sqlite"),
@@ -205,7 +205,6 @@ function privateStrings(config: Config, controllers: readonly string[]): string[
     ...(config.historicalWorkspaces ?? []).map((workspace) => workspace.path),
     ...Object.values(config.sources).flatMap((paths) => paths ?? []),
     ...(config.inputProvenance ?? []),
-    ...controllers,
   ].filter((value, index, values) => value.length > 1 && values.indexOf(value) === index);
 }
 
@@ -227,7 +226,33 @@ function assertPublicContent(content: string, privateValues: readonly string[], 
   }
 }
 
-function assertExport(exportResult: ExportResult, privateValues: readonly string[]): void {
+function assertNoPrivateControllerValues(
+  value: unknown,
+  controllers: readonly string[],
+  label: string,
+): void {
+  if (controllers.length === 0) return;
+  const protectedControllers = new Set(controllers);
+  const pending: unknown[] = [value];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (typeof current === "string") {
+      if (protectedControllers.has(current)) fail(`${label} contains a private controller value`);
+      continue;
+    }
+    if (Array.isArray(current)) {
+      pending.push(...current);
+      continue;
+    }
+    if (typeof current === "object" && current !== null) pending.push(...Object.values(current));
+  }
+}
+
+function assertExport(
+  exportResult: ExportResult,
+  privateValues: readonly string[],
+  controllers: readonly string[],
+): void {
   exactEntries(exportResult.outDir, EXPORT_FILES, "Generated export");
   for (const file of EXPORT_FILES) {
     const path = join(exportResult.outDir, file);
@@ -240,6 +265,7 @@ function assertExport(exportResult: ExportResult, privateValues: readonly string
   } catch {
     fail("Generated activity.json is not valid JSON");
   }
+  assertNoPrivateControllerValues(snapshot, controllers, "Generated activity.json");
   const parsed = publicSnapshotSchema.safeParse(snapshot);
   if (!parsed.success) fail(`Generated activity.json failed public schema validation: ${parsed.error.message}`);
   if (JSON.stringify(parsed.data) !== JSON.stringify(exportResult.snapshot)) {
@@ -251,6 +277,7 @@ function assertManagedCheckout(
   checkout: string,
   exportResult?: ExportResult,
   privateValues?: readonly string[],
+  controllers?: readonly string[],
 ): void {
   assertRealDirectory(checkout, "Pages checkout");
   exactEntries(checkout, [".git", ...MANAGED_ROOT_FILES], "Pages checkout");
@@ -280,6 +307,9 @@ function assertManagedCheckout(
     snapshot = JSON.parse(readFileSync(join(docs, "activity.json"), "utf8"));
   } catch {
     fail("Pages activity.json is not valid JSON");
+  }
+  if (controllers !== undefined) {
+    assertNoPrivateControllerValues(snapshot, controllers, "Pages activity.json");
   }
   if (exportResult !== undefined) {
     const parsed = publicSnapshotSchema.safeParse(snapshot);
@@ -522,8 +552,9 @@ function installGeneratedAssets(
   checkout: string,
   exportResult: ExportResult,
   privateValues: readonly string[],
+  controllers: readonly string[],
 ): void {
-  assertExport(exportResult, privateValues);
+  assertExport(exportResult, privateValues, controllers);
   const docs = join(checkout, "docs");
   if (exists(docs)) replaceableEntries(docs, "Pages docs directory");
   else mkdirSync(docs, { mode: 0o755 });
@@ -535,7 +566,7 @@ function installGeneratedAssets(
   if (exists(marker)) assertMarker(marker);
   else writeFileSync(marker, MARKER_TEXT, { encoding: "utf8", flag: "wx", mode: 0o644 });
   chmodSync(marker, 0o644);
-  assertManagedCheckout(checkout, exportResult, privateValues);
+  assertManagedCheckout(checkout, exportResult, privateValues, controllers);
 }
 
 async function stageAndValidate(
@@ -543,13 +574,14 @@ async function stageAndValidate(
   checkout: string,
   exportResult: ExportResult,
   privateValues: readonly string[],
+  controllers: readonly string[],
 ): Promise<boolean> {
   await gitCommand(git, ["add", "--", ...STAGED_PATHS], checkout);
   const names = await gitCommand(git, ["diff", "--cached", "--name-only", "--diff-filter=ACDMRTUXB", "-z"], checkout);
   const staged = names === "" ? [] : names.split("\0").filter(Boolean);
   const allowed = new Set<string>(STAGED_PATHS);
   if (staged.some((path) => !allowed.has(path))) fail("Git index contains a path outside the Vito Pages allowlist");
-  assertManagedCheckout(checkout, exportResult, privateValues);
+  assertManagedCheckout(checkout, exportResult, privateValues, controllers);
   const difference = await gitResult(git, ["diff", "--cached", "--quiet", "--exit-code"], checkout);
   if (difference.exitCode === 0) return false;
   if (difference.exitCode === 1) return true;
@@ -678,7 +710,8 @@ async function runPublication(config: Config, options: PublishOptions, setup: bo
     pushed: false,
   };
   if (options.dryRun) return base;
-  const privacyValues = privateStrings(config, retainedControllers(config));
+  const controllers = retainedControllers(config);
+  const privacyValues = privateStrings(config);
 
   const transport = options.transport ?? defaultPagesTransport;
   const git = options.git ?? defaultGitTransport;
@@ -686,8 +719,8 @@ async function runPublication(config: Config, options: PublishOptions, setup: bo
   if (setup) await requireDedicatedRepository(config, transport);
   const existingPages = await inspectPages(config, transport, setup);
   const prepared = await prepareCheckout(config, git, repository.cloneUrl, setup);
-  installGeneratedAssets(prepared.checkout, exportResult, privacyValues);
-  const changed = await stageAndValidate(git, prepared.checkout, exportResult, privacyValues);
+  installGeneratedAssets(prepared.checkout, exportResult, privacyValues, controllers);
+  const changed = await stageAndValidate(git, prepared.checkout, exportResult, privacyValues, controllers);
   let commit = prepared.local;
   if (changed) commit = await commitChanges(git, prepared.checkout, prepared.pending);
   if (commit === null) fail("Pages checkout has no publishable commit");

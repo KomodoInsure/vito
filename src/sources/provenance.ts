@@ -42,6 +42,9 @@ interface StoredInput extends Record<string, unknown> {
   at_ms: number | null;
   kind: InputRecord["kind"];
   origin_evidence: InputRecord["originEvidence"];
+  native_controller: string | null;
+  native_origin: InputRecord["origin"] | null;
+  native_origin_evidence: "source" | "none" | null;
 }
 
 export const inputProvenanceEventSchema = z
@@ -93,7 +96,10 @@ function retainedClaims(store: CollectorStore): StoredProvenance[] {
 
 function retainedMatchingInputs(store: CollectorStore): StoredInput[] {
   return store.database.query(`
-    SELECT input_events.*
+    SELECT input_events.*,
+      input_native_evidence.controller AS native_controller,
+      input_native_evidence.origin AS native_origin,
+      input_native_evidence.origin_evidence AS native_origin_evidence
     FROM input_events
     INNER JOIN (
       SELECT DISTINCT agent, native_session_id, native_input_id
@@ -102,9 +108,33 @@ function retainedMatchingInputs(store: CollectorStore): StoredInput[] {
       ON claims.agent = input_events.agent
       AND claims.native_session_id = input_events.native_session_id
       AND claims.native_input_id = input_events.native_input_id
+    LEFT JOIN input_native_evidence
+      ON input_native_evidence.origin_key = input_events.origin_key
     ORDER BY input_events.agent, input_events.native_session_id,
       input_events.native_input_id, input_events.origin_key
   `).all() as StoredInput[];
+}
+
+function nativeInputRecord(row: StoredInput): InputRecord {
+  const current = storedInputRecord(row);
+  if (current === null) throw new Error("Stored input failed provenance reconciliation validation");
+  if (row.native_origin_evidence === null || row.native_origin === null) {
+    if (current.originEvidence !== "provenance") return current;
+    return {
+      ...current,
+      controller: null,
+      origin: "unknown",
+      originEvidence: "none",
+      reasons: current.reasons.filter((reason) => reason !== "input-origin-conflict"),
+    };
+  }
+  return {
+    ...current,
+    controller: row.native_controller,
+    origin: row.native_origin,
+    originEvidence: row.native_origin_evidence,
+    reasons: current.reasons.filter((reason) => reason !== "input-origin-conflict"),
+  };
 }
 
 function reconcileRetainedClaims(
@@ -145,23 +175,32 @@ function reconcileRetainedClaims(
           submissions.size === 0 ? "input-provenance-pending" : "input-provenance-ambiguous",
           1,
         );
-        store.database.query(`
-          UPDATE input_events
-          SET origin = 'unknown', origin_evidence = 'none', controller = NULL
-          WHERE agent = ? AND native_session_id = ? AND native_input_id = ?
-            AND origin_evidence = 'provenance'
-        `).run(
-          tupleClaims[0]!.agent,
-          tupleClaims[0]!.native_session_id,
-          tupleClaims[0]!.native_input_id,
-        );
+        for (const row of tupleInputs) {
+          if (
+            row.origin_evidence !== "provenance"
+            && !(row.origin_evidence === "conflict" && row.native_origin_evidence !== null)
+          ) {
+            continue;
+          }
+          const native = nativeInputRecord(row);
+          store.database.query(`
+            UPDATE input_events
+            SET controller = ?, origin = ?, origin_evidence = ?, reasons_json = ?
+            WHERE origin_key = ?
+          `).run(
+            native.controller,
+            native.origin,
+            native.originEvidence,
+            JSON.stringify([...new Set(native.reasons)].sort()),
+            native.originKey,
+          );
+        }
         continue;
       }
 
       const row = submissions.values().next().value;
       if (row === undefined) continue;
-      const native = storedInputRecord(row);
-      if (native === null) throw new Error("Stored input failed provenance reconciliation validation");
+      const native = nativeInputRecord(row);
       const observations: InputRecord[] = tupleClaims.map((claim) => ({
         ...native,
         origin: claim.origin,

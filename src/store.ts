@@ -232,6 +232,17 @@ CREATE TABLE IF NOT EXISTS input_events (
   )
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS input_native_evidence (
+  origin_key TEXT PRIMARY KEY CHECK (length(origin_key) > 0),
+  controller TEXT CHECK (controller IS NULL OR (length(controller) BETWEEN 1 AND 128)),
+  origin TEXT NOT NULL CHECK (origin IN ('human','automated','unknown')),
+  origin_evidence TEXT NOT NULL CHECK (origin_evidence IN ('source','none')),
+  CHECK (
+    (origin_evidence = 'none' AND origin = 'unknown') OR
+    (origin_evidence = 'source' AND origin IN ('human','automated'))
+  )
+) STRICT, WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS input_source_state (
   source_key TEXT PRIMARY KEY CHECK (length(source_key) > 0),
   agent TEXT NOT NULL CHECK (agent IN ('codex','claude','omp','opencode','hermes')),
@@ -720,6 +731,15 @@ export class CollectorStore {
       record.originEvidence, record.quality, normalizedReasons(record.reasons),
       scopeDecision, scopeReason, updatedAtMs,
     );
+    if (record.originEvidence === "source" || record.originEvidence === "none") {
+      this.database.query(`
+        INSERT INTO input_native_evidence (origin_key, controller, origin, origin_evidence)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(origin_key) DO UPDATE SET
+          controller=excluded.controller, origin=excluded.origin,
+          origin_evidence=excluded.origin_evidence
+      `).run(record.originKey, record.controller, record.origin, record.originEvidence);
+    }
   }
 
   upsertInputSourceState(record: InputSourceState): void {
@@ -1020,6 +1040,8 @@ export class CollectorStore {
       SELECT controller FROM input_events WHERE controller IS NOT NULL
       UNION
       SELECT controller FROM input_provenance WHERE controller IS NOT NULL
+      UNION
+      SELECT controller FROM input_native_evidence WHERE controller IS NOT NULL
       ORDER BY controller
     `).all() as Array<{ controller: string }>;
     return rows.map((row) => row.controller);
