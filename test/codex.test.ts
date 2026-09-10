@@ -605,7 +605,7 @@ describe("Codex adapter collection", () => {
     }
   });
 
-  test("retains a first-backfill partition gap after that partition disappears", async () => {
+  test("retains an aggregate partition gap without assigning it to a clean session", async () => {
     const temporary = mkdtempSync(join(tmpdir(), "vito-codex-disappearing-gap-"));
     const sourceRoot = join(temporary, "codex");
     const stateDir = join(temporary, "state");
@@ -674,13 +674,15 @@ describe("Codex adapter collection", () => {
 
       const group = buildPublicSnapshot(config, store, BASE + 20_000).inputRanges["7"].all;
       expect(group.inputs.value).toEqual({
-        human: 1,
-        automated: 0,
-        unknown: 0,
+        inputs: 1,
         activeSessions: 1,
       });
       expect(group.cadence.value).toBeNull();
-      expect(group.cadenceCoverage.excluded.inputHistory).toBe(1);
+      expect(group.cadenceCoverage.excluded).toEqual({
+        inputHistory: 0,
+        mixedScope: 0,
+        noRecordedWork: 1,
+      });
     } finally {
       store.close();
       rmSync(temporary, { recursive: true, force: true });

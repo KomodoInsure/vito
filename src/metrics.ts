@@ -7,8 +7,8 @@ import {
   publicSnapshotSchema,
   sanitizePublicLabel,
   type Agent,
-  type HumanCadenceCoverage,
-  type HumanCadenceStats,
+  type InputCadenceCoverage,
+  type InputCadenceStats,
   type InputOrigin,
   type Metric,
   type PublicCost,
@@ -696,7 +696,7 @@ function usageRowsForDay(records: readonly UsageRecord[], evidenceByAgent: Reado
 }
 
 
-const CADENCE_EXCLUSION_KEYS = ["inputHistory", "mixedScope", "unknownOrigin", "noHumanInput", "noRecordedWork"] as const;
+const CADENCE_EXCLUSION_KEYS = ["inputHistory", "mixedScope", "noRecordedWork"] as const;
 const INPUT_EXCLUSION_KEYS = ["context", "replayed", "unknownKind", "subagent", "unknownLane", "undated"] as const;
 
 function addSafe(left: number, right: number, label: string): number {
@@ -705,10 +705,10 @@ function addSafe(left: number, right: number, label: string): number {
   return value;
 }
 
-function emptyCadenceCoverage(): HumanCadenceCoverage {
+function emptyCadenceCoverage(): InputCadenceCoverage {
   return {
     consideredSessions: 0,
-    excluded: { inputHistory: 0, mixedScope: 0, unknownOrigin: 0, noHumanInput: 0, noRecordedWork: 0 },
+    excluded: { inputHistory: 0, mixedScope: 0, noRecordedWork: 0 },
   };
 }
 
@@ -723,6 +723,15 @@ function usableInputState(state: InputSourceStateRow | undefined): state is Inpu
     state.quality === "recorded";
 }
 
+// Aggregate source quality still controls the public metric status. Session
+// eligibility uses compatible scan state plus that session's row-level gaps,
+// so an unrelated damaged partition cannot exclude every clean session.
+function hasUsableSessionInputState(state: InputSourceStateRow | undefined): state is InputSourceStateRow {
+  return state !== undefined &&
+    state.parser_version === 1 &&
+    state.quality !== "unavailable";
+}
+
 function inputVolumeReasons(rows: readonly InputRow[], states: readonly InputSourceStateRow[], gap: boolean): PublicReasonCode[] {
   const stateReasons = states.flatMap((state) => parseStringArray(state.reasons_json));
   const rowReasons = rows.flatMap((row) => parseStringArray(row.reasons_json))
@@ -731,15 +740,13 @@ function inputVolumeReasons(rows: readonly InputRow[], states: readonly InputSou
 }
 
 function countInputPopulation(rows: readonly InputRow[], startMs: number, cutoffMs: number): {
-  stats: { human: number; automated: number; unknown: number; activeSessions: number };
+  stats: { inputs: number; activeSessions: number };
   sessions: Map<string, InputRow[]>;
   excluded: PublicInputGroup["excluded"];
 } {
   const excluded = emptyInputExclusions();
   const sessions = new Map<string, InputRow[]>();
-  let human = 0;
-  let automated = 0;
-  let unknown = 0;
+  let inputs = 0;
   for (const row of rows) {
     if (row.scope_decision !== "included") continue;
     if (row.at_ms === null) {
@@ -767,14 +774,12 @@ function countInputPopulation(rows: readonly InputRow[], startMs: number, cutoff
       excluded.unknownLane = addSafe(excluded.unknownLane, 1, "Unknown-lane input count");
       continue;
     }
-    if (row.origin === "human") human = addSafe(human, 1, "Human input count");
-    else if (row.origin === "automated") automated = addSafe(automated, 1, "Automated input count");
-    else unknown = addSafe(unknown, 1, "Unknown-origin input count");
+    inputs = addSafe(inputs, 1, "Input count");
     const entries = sessions.get(row.session_key) ?? [];
     entries.push(row);
     sessions.set(row.session_key, entries);
   }
-  return { stats: { human, automated, unknown, activeSessions: sessions.size }, sessions, excluded };
+  return { stats: { inputs, activeSessions: sessions.size }, sessions, excluded };
 }
 
 function inputGroupForAgent(
@@ -820,12 +825,11 @@ function inputGroupForAgent(
   }
 
   let sessions = 0;
-  let humanInputs = 0;
+  let measuredInputs = 0;
   const measuredIntervals: WorkInterval[] = [];
-  let hasOriginConflict = false;
   for (const [sessionKey, counted] of population.sessions) {
     const candidates = rowsBySession.get(sessionKey) ?? counted;
-    const inputHistory = candidates.some((row) => !usableInputState(stateBySource.get(row.source_key))) ||
+    const inputHistory = candidates.some((row) => !hasUsableSessionInputState(stateBySource.get(row.source_key))) ||
       candidates.some((row) => row.at_ms === null && row.kind !== "context" && row.kind !== "replay") ||
       candidates.some((row) =>
         row.at_ms !== null &&
@@ -851,19 +855,9 @@ function inputGroupForAgent(
       cadenceCoverage.excluded.mixedScope = addSafe(cadenceCoverage.excluded.mixedScope, 1, "Mixed-scope exclusion count");
       continue;
     }
-    if (counted.some((row) => row.origin === "unknown")) {
-      cadenceCoverage.excluded.unknownOrigin = addSafe(cadenceCoverage.excluded.unknownOrigin, 1, "Unknown-origin exclusion count");
-      if (counted.some((row) => row.origin_evidence === "conflict")) hasOriginConflict = true;
-      continue;
-    }
-    const humans = counted.filter((row) => row.origin === "human");
-    if (humans.length === 0) {
-      cadenceCoverage.excluded.noHumanInput = addSafe(cadenceCoverage.excluded.noHumanInput, 1, "No-human-input exclusion count");
-      continue;
-    }
-    const firstHumanMs = Math.min(...humans.map((row) => row.at_ms!));
+    const firstInputMs = Math.min(...counted.map((row) => row.at_ms!));
     const clipped = (workBySession.get(sessionKey) ?? []).flatMap((interval) => {
-      const clippedStart = Math.max(firstHumanMs, interval.startMs);
+      const clippedStart = Math.max(firstInputMs, interval.startMs);
       const clippedEnd = Math.min(cutoffMs, interval.endMs);
       return clippedEnd > clippedStart ? [{ ...interval, startMs: clippedStart, endMs: clippedEnd }] : [];
     });
@@ -872,7 +866,7 @@ function inputGroupForAgent(
       continue;
     }
     sessions = addSafe(sessions, 1, "Measured session count");
-    humanInputs = addSafe(humanInputs, humans.length, "Measured human input count");
+    measuredInputs = addSafe(measuredInputs, counted.length, "Measured input count");
     measuredIntervals.push(...clipped);
   }
 
@@ -882,13 +876,11 @@ function inputGroupForAgent(
   );
   const exclusionReasons = fixedReasons(
     cadenceCoverage.excluded.inputHistory > 0 || cadenceCoverage.excluded.mixedScope > 0 ? ["input-history-incomplete"] : [],
-    cadenceCoverage.excluded.unknownOrigin > 0 ? ["input-origin-unknown"] : [],
-    hasOriginConflict ? ["input-origin-conflict"] : [],
     cadenceCoverage.excluded.noRecordedWork > 0 ? ["timing-unavailable"] : [],
   );
-  let cadence: Metric<HumanCadenceStats>;
+  let cadence: Metric<InputCadenceStats>;
   if (sessions === 0) {
-    cadence = metric<HumanCadenceStats>(null, "unavailable", exclusionReasons);
+    cadence = metric<InputCadenceStats>(null, "unavailable", exclusionReasons);
   } else {
     const workEvidence = evidenceForSources(sourceRows.filter((row) => row.agent === agent), "work");
     const measured = aggregateWorkIntervals(measuredIntervals, startMs, cutoffMs, {
@@ -899,7 +891,7 @@ function inputGroupForAgent(
     if (recordedWorkMs <= 0) throw new RangeError("Measured cadence must contain positive recorded work");
     const partial = inputs.status !== "recorded" || measured.status !== "recorded" || exclusionCount > 0;
     cadence = metric(
-      { sessions, humanInputs, recordedWorkMs },
+      { sessions, inputs: measuredInputs, recordedWorkMs },
       partial ? "partial" : "recorded",
       fixedReasons(measured.reasons, exclusionReasons, inputs.status === "recorded" ? [] : inputs.reasons),
     );
@@ -913,11 +905,9 @@ function combineInputGroups(
 ): PublicInputGroup {
   const availableInputs = entries.flatMap((entry) => entry.group.inputs.value === null ? [] : [entry.group.inputs.value]);
   const inputsValue = availableInputs.length === 0 ? null : availableInputs.reduce((total, value) => ({
-    human: addSafe(total.human, value.human, "All-harness human input count"),
-    automated: addSafe(total.automated, value.automated, "All-harness automated input count"),
-    unknown: addSafe(total.unknown, value.unknown, "All-harness unknown input count"),
+    inputs: addSafe(total.inputs, value.inputs, "All-harness input count"),
     activeSessions: addSafe(total.activeSessions, value.activeSessions, "All-harness active session count"),
-  }), { human: 0, automated: 0, unknown: 0, activeSessions: 0 });
+  }), { inputs: 0, activeSessions: 0 });
   const enabledInputGap = entries.some((entry) => enabled.has(entry.harness) && entry.group.inputs.status !== "recorded");
   const inputPartial = entries.some((entry) => entry.group.inputs.value !== null && entry.group.inputs.status !== "recorded") || enabledInputGap;
   const inputReasons = fixedReasons(...entries.map((entry) => entry.group.inputs.reasons));
@@ -946,9 +936,9 @@ function combineInputGroups(
   const measured = entries.flatMap((entry) => entry.group.cadence.value === null ? [] : [entry.group.cadence.value]);
   const cadenceValue = measured.length === 0 ? null : measured.reduce((total, value) => ({
     sessions: addSafe(total.sessions, value.sessions, "All-harness measured session count"),
-    humanInputs: addSafe(total.humanInputs, value.humanInputs, "All-harness measured human input count"),
+    inputs: addSafe(total.inputs, value.inputs, "All-harness measured input count"),
     recordedWorkMs: addSafe(total.recordedWorkMs, value.recordedWorkMs, "All-harness recorded work"),
-  }), { sessions: 0, humanInputs: 0, recordedWorkMs: 0 });
+  }), { sessions: 0, inputs: 0, recordedWorkMs: 0 });
   const anyExclusion = Object.values(cadenceCoverage.excluded).some((count) => count > 0);
   const cadencePartial = entries.some((entry) => entry.group.cadence.value !== null && entry.group.cadence.status !== "recorded") ||
     enabledInputGap ||
@@ -1189,7 +1179,7 @@ export function buildPublicSnapshot(config: Config, store: CollectorStore, cutof
       agents,
     );
     const snapshot: PublicSnapshot = {
-      schemaVersion: 5,
+      schemaVersion: 6,
       pricing: { ...PRICING_METADATA, sources: [...PRICING_METADATA.sources] },
       organization: config.companyName ?? "Komodo Risk Inc",
       timezone: config.timezone,

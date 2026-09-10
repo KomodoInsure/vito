@@ -293,7 +293,7 @@ describe("Pages publisher", () => {
     });
 
     expect(result.pushed).toBe(true);
-    expect(publicSnapshotSchema.parse(JSON.parse(remoteFile(value, "docs/activity.json"))).schemaVersion).toBe(5);
+    expect(publicSnapshotSchema.parse(JSON.parse(remoteFile(value, "docs/activity.json"))).schemaVersion).toBe(6);
   }, 30_000);
 
   test("upgrades a managed checkout from the pre-NOTICE file set", async () => {

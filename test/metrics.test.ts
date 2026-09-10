@@ -581,17 +581,17 @@ describe("public snapshot", () => {
 
       const group = buildPublicSnapshot(config(store.stateDir), store, cutoff).inputRanges["7"].all;
       expect(group.inputs).toMatchObject({
-        value: { human: 5, automated: 2, unknown: 1, activeSessions: 6 },
+        value: { inputs: 8, activeSessions: 6 },
         status: "partial",
       });
       expect(group.cadence).toEqual({
-        value: { sessions: 1, humanInputs: 2, recordedWorkMs: 600_000 },
+        value: { sessions: 3, inputs: 5, recordedWorkMs: 8_400_000 },
         status: "partial",
-        reasons: ["input-history-incomplete", "input-origin-unknown", "timing-unavailable"],
+        reasons: ["input-history-incomplete", "timing-unavailable"],
       });
       expect(group.cadenceCoverage).toEqual({
         consideredSessions: 6,
-        excluded: { inputHistory: 1, mixedScope: 1, unknownOrigin: 1, noHumanInput: 1, noRecordedWork: 1 },
+        excluded: { inputHistory: 1, mixedScope: 1, noRecordedWork: 1 },
       });
     } finally {
       store.close();
@@ -599,32 +599,40 @@ describe("public snapshot", () => {
   });
 
 
-  test("does not admit cadence from a partial aggregate input source state", () => {
+  test("admits a clean session when only aggregate input coverage is partial", () => {
     const store = temporaryStore();
     try {
       const cutoff = Date.parse("2026-09-09T12:00:00Z");
       const at = Date.parse("2026-09-08T12:00:00Z");
       installCodexSource(store);
-      installInputState(store, "codex", "codex", "partial");
       store.writeBatch({
+        inputSourceStates: [{
+          sourceKey: "codex",
+          agent: "codex",
+          parserVersion: 1,
+          quality: "partial",
+          reasons: ["input-history-incomplete"],
+          scannedAtMs: cutoff,
+          lastSuccessfulScanMs: null,
+        }],
         inputs: [input("aggregate-partial-human", "aggregate-partial", at, { sourceKey: "codex" })],
         workIntervals: [interval("aggregate-partial-work", "codex", "aggregate-partial", at, at + 600_000)],
       });
 
       const group = buildPublicSnapshot(config(store.stateDir), store, cutoff).inputRanges["7"].all;
       expect(group.inputs).toMatchObject({
-        value: { human: 1, automated: 0, unknown: 0, activeSessions: 1 },
+        value: { inputs: 1, activeSessions: 1 },
         status: "partial",
         reasons: ["input-history-incomplete"],
       });
       expect(group.cadence).toEqual({
-        value: null,
-        status: "unavailable",
+        value: { sessions: 1, inputs: 1, recordedWorkMs: 600_000 },
+        status: "partial",
         reasons: ["input-history-incomplete"],
       });
       expect(group.cadenceCoverage).toEqual({
         consideredSessions: 1,
-        excluded: { inputHistory: 1, mixedScope: 0, unknownOrigin: 0, noHumanInput: 0, noRecordedWork: 0 },
+        excluded: { inputHistory: 0, mixedScope: 0, noRecordedWork: 0 },
       });
     } finally {
       store.close();
@@ -652,9 +660,9 @@ describe("public snapshot", () => {
       });
 
       expect(buildPublicSnapshot(config(store.stateDir), store, cutoff).inputRanges["7"].all).toMatchObject({
-        inputs: { value: { human: 3, automated: 0, unknown: 0, activeSessions: 2 }, status: "recorded" },
+        inputs: { value: { inputs: 3, activeSessions: 2 }, status: "recorded" },
         cadence: {
-          value: { sessions: 2, humanInputs: 3, recordedWorkMs: 1_200_000 },
+          value: { sessions: 2, inputs: 3, recordedWorkMs: 1_200_000 },
           status: "recorded",
           reasons: [],
         },
@@ -681,15 +689,15 @@ describe("public snapshot", () => {
 
       const ranges = buildPublicSnapshot(config(store.stateDir), store, cutoff).inputRanges;
       expect(ranges["7"].all).toMatchObject({
-        inputs: { value: { human: 1, automated: 0, unknown: 0, activeSessions: 1 } },
-        cadence: { value: { sessions: 1, humanInputs: 1, recordedWorkMs: 600_000 } },
+        inputs: { value: { inputs: 1, activeSessions: 1 } },
+        cadence: { value: { sessions: 1, inputs: 1, recordedWorkMs: 600_000 } },
       });
       expect(ranges["30"].all).toMatchObject({
-        inputs: { value: { human: 1, automated: 0, unknown: 1, activeSessions: 1 } },
-        cadence: { value: null, status: "unavailable", reasons: ["input-origin-unknown"] },
+        inputs: { value: { inputs: 2, activeSessions: 1 } },
+        cadence: { value: { sessions: 1, inputs: 2, recordedWorkMs: 600_000 }, status: "recorded", reasons: [] },
         cadenceCoverage: {
           consideredSessions: 1,
-          excluded: { inputHistory: 0, mixedScope: 0, unknownOrigin: 1, noHumanInput: 0, noRecordedWork: 0 },
+          excluded: { inputHistory: 0, mixedScope: 0, noRecordedWork: 0 },
         },
       });
     } finally {
@@ -714,14 +722,14 @@ describe("public snapshot", () => {
       });
 
       const group = buildPublicSnapshot(config(store.stateDir, "America/Los_Angeles"), store, cutoff).inputRanges["7"].all;
-      expect(group.inputs.value).toEqual({ human: 2, automated: 0, unknown: 0, activeSessions: 1 });
-      expect(group.cadence.value).toEqual({ sessions: 1, humanInputs: 2, recordedWorkMs: 600_000 });
+      expect(group.inputs.value).toEqual({ inputs: 2, activeSessions: 1 });
+      expect(group.cadence.value).toEqual({ sessions: 1, inputs: 2, recordedWorkMs: 600_000 });
     } finally {
       store.close();
     }
   });
 
-  test("keeps known-empty supporting input counts but makes empty and automated-only cadence unavailable", () => {
+  test("keeps known-empty counts and measures automated submissions with recorded work", () => {
     const store = temporaryStore();
     try {
       const cutoff = Date.parse("2026-09-09T12:00:00Z");
@@ -729,22 +737,29 @@ describe("public snapshot", () => {
       installInputState(store);
       const empty = buildPublicSnapshot(config(store.stateDir), store, cutoff).inputRanges["7"].all;
       expect(empty.inputs).toEqual({
-        value: { human: 0, automated: 0, unknown: 0, activeSessions: 0 },
+        value: { inputs: 0, activeSessions: 0 },
         status: "recorded",
         reasons: [],
       });
       expect(empty.cadence).toEqual({ value: null, status: "unavailable", reasons: [] });
 
-      store.writeBatch({ inputs: [
-        input("automated-only", "automated-session", Date.parse("2026-09-08T12:00:00Z"), {
-          origin: "automated",
-          originEvidence: "source",
-        }),
-      ] });
+      const automatedAt = Date.parse("2026-09-08T12:00:00Z");
+      store.writeBatch({
+        inputs: [
+          input("automated-only", "automated-session", automatedAt, {
+            origin: "automated",
+            originEvidence: "source",
+          }),
+        ],
+        workIntervals: [interval("automated-work", "codex", "automated-session", automatedAt, automatedAt + 600_000)],
+      });
       const automated = buildPublicSnapshot(config(store.stateDir), store, cutoff).inputRanges["7"].all;
-      expect(automated.inputs.value).toEqual({ human: 0, automated: 1, unknown: 0, activeSessions: 1 });
-      expect(automated.cadence).toEqual({ value: null, status: "unavailable", reasons: [] });
-      expect(automated.cadenceCoverage.excluded.noHumanInput).toBe(1);
+      expect(automated.inputs.value).toEqual({ inputs: 1, activeSessions: 1 });
+      expect(automated.cadence).toEqual({
+        value: { sessions: 1, inputs: 1, recordedWorkMs: 600_000 },
+        status: "recorded",
+        reasons: [],
+      });
     } finally {
       store.close();
     }
@@ -777,17 +792,17 @@ describe("public snapshot", () => {
       expect(range.byHarness.map((entry) => entry.harness)).toEqual(["codex", "claude"]);
       expect(range.byHarness[1]?.group).toMatchObject({
         inputs: {
-          value: { human: 1, automated: 0, unknown: 0, activeSessions: 1 },
+          value: { inputs: 1, activeSessions: 1 },
           status: "partial",
         },
         cadence: { value: null, status: "unavailable", reasons: ["input-history-incomplete"] },
         cadenceCoverage: {
           consideredSessions: 1,
-          excluded: { inputHistory: 1, mixedScope: 0, unknownOrigin: 0, noHumanInput: 0, noRecordedWork: 0 },
+          excluded: { inputHistory: 1, mixedScope: 0, noRecordedWork: 0 },
         },
         excluded: { context: 1, replayed: 1, unknownKind: 1, subagent: 1, unknownLane: 1, undated: 1 },
       });
-      expect(range.all.inputs.value).toEqual({ human: 1, automated: 0, unknown: 0, activeSessions: 1 });
+      expect(range.all.inputs.value).toEqual({ inputs: 1, activeSessions: 1 });
       expect(range.all.excluded).toEqual({ context: 1, replayed: 1, unknownKind: 1, subagent: 1, unknownLane: 1, undated: 1 });
     } finally {
       store.close();

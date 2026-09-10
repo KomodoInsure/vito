@@ -5,7 +5,7 @@ import { AriaComponent, GridComponent, TooltipComponent } from "echarts/componen
 import { SVGRenderer } from "echarts/renderers";
 import type {
   Agent,
-  HumanCadenceStats,
+  InputCadenceStats,
   InputStats,
   Metric,
   PublicCost,
@@ -226,9 +226,9 @@ function isWorkGroup(value: unknown): value is PublicWorkGroup {
   );
 }
 
-const INPUT_COUNTER_KEYS = ["human", "automated", "unknown", "activeSessions"] as const;
-const CADENCE_COUNTER_KEYS = ["sessions", "humanInputs", "recordedWorkMs"] as const;
-const CADENCE_EXCLUDED_KEYS = ["inputHistory", "mixedScope", "unknownOrigin", "noHumanInput", "noRecordedWork"] as const;
+const INPUT_COUNTER_KEYS = ["inputs", "activeSessions"] as const;
+const CADENCE_COUNTER_KEYS = ["sessions", "inputs", "recordedWorkMs"] as const;
+const CADENCE_EXCLUDED_KEYS = ["inputHistory", "mixedScope", "noRecordedWork"] as const;
 const INPUT_EXCLUDED_KEYS = ["context", "replayed", "unknownKind", "subagent", "unknownLane", "undated"] as const;
 
 function safeCountSum(values: readonly number[]): number | null {
@@ -242,22 +242,21 @@ function safeCountSum(values: readonly number[]): number | null {
 
 function isInputStats(value: unknown): value is InputStats {
   if (!isObject(value) || !hasOnlyKeys(value, INPUT_COUNTER_KEYS)) return false;
-  const { human, automated, unknown, activeSessions } = value;
-  if (!isCount(human) || !isCount(automated) || !isCount(unknown) || !isCount(activeSessions)) return false;
-  const total = safeCountSum([human, automated, unknown]);
-  return total !== null &&
-    total >= activeSessions &&
-    ((total === 0) === (activeSessions === 0));
+  const { inputs, activeSessions } = value;
+  return isCount(inputs) &&
+    isCount(activeSessions) &&
+    inputs >= activeSessions &&
+    ((inputs === 0) === (activeSessions === 0));
 }
 
-function isCadenceStats(value: unknown): value is HumanCadenceStats {
+function isCadenceStats(value: unknown): value is InputCadenceStats {
   if (!isObject(value) || !hasOnlyKeys(value, CADENCE_COUNTER_KEYS)) return false;
-  const { sessions, humanInputs, recordedWorkMs } = value;
+  const { sessions, inputs, recordedWorkMs } = value;
   return isCount(sessions) &&
-    isCount(humanInputs) &&
+    isCount(inputs) &&
     isCount(recordedWorkMs) &&
     sessions > 0 &&
-    humanInputs >= sessions &&
+    inputs >= sessions &&
     recordedWorkMs > 0;
 }
 
@@ -289,7 +288,7 @@ function isInputGroup(value: unknown): value is PublicInputGroup {
   ]);
   if (classified === null || classified !== considered) return false;
   return cadenceStats === null || inputStats !== null &&
-    cadenceStats.humanInputs <= inputStats.human &&
+    cadenceStats.inputs <= inputStats.inputs &&
     cadenceStats.sessions <= inputStats.activeSessions;
 }
 
@@ -386,7 +385,7 @@ function isDay(value: unknown): value is PublicDay {
 export function isPublicSnapshot(value: unknown): value is PublicSnapshot {
   if (!isObject(value) || !hasOnlyKeys(value, ["schemaVersion", "pricing", "organization", "timezone", "generatedAt", "cutoff", "periodStart", "periodEnd", "collectionStatus", "sources", "coverage", "inputRanges", "days"])) return false;
   return (
-    value.schemaVersion === 5 &&
+    value.schemaVersion === 6 &&
     typeof value.organization === "string" && value.organization.length >= 1 && value.organization.length <= 80 &&
     value.organization.trim() === value.organization &&
     isObject(value.pricing) && hasOnlyKeys(value.pricing, ["asOf", "basis", "sources"]) &&
@@ -572,20 +571,15 @@ export function buildUsageSeries(days: readonly PublicDay[], harness: Agent | "a
     }
     return { date: day.date, values, fullTotal: hasTotal ? fullTotal : null };
   });
-  const ranked = [...totals].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
-  const unknown = ranked.filter(([key]) => key === `unknown${MODEL_SEPARATOR}unknown` || key.endsWith(`${MODEL_SEPARATOR}unknown`));
-  const known = ranked.filter(([key]) => !unknown.some(([unknownKey]) => unknownKey === key));
-  const top = known.slice(0, 6).map(([key]) => key);
-  const other = known.slice(6).map(([key]) => key);
-  const keys = [...top, ...(other.length > 0 ? ["Other"] : []), ...unknown.map(([key]) => key)];
+  const keys = [...totals]
+    .filter(([, total]) => total > 0)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([key]) => key);
   return {
     keys,
     values: raw.map((point) => {
       const values: Record<string, number | null> = {};
-      for (const key of top) values[key] = point.values.get(key) === null ? null : point.values.get(key) ?? 0;
-      if (other.length > 0) values.Other = other.some((key) => point.values.get(key) === null)
-        ? null : other.reduce((sum, key) => sum + (point.values.get(key) ?? 0), 0);
-      for (const [key] of unknown) values[key] = point.values.get(key) === null ? null : point.values.get(key) ?? 0;
+      for (const key of keys) values[key] = point.values.get(key) === null ? null : point.values.get(key) ?? 0;
       if (point.fullTotal === null) for (const key of keys) values[key] = null;
       return { date: point.date, values, fullTotal: point.fullTotal };
     }),
@@ -748,7 +742,6 @@ function renderMetricCard(
 const SERIES_COLORS = ["var(--series-1)", "var(--series-2)", "var(--series-3)", "var(--series-4)", "var(--series-5)", "var(--series-6)"] as const;
 
 function seriesColor(key: string, index: number): string {
-  if (key === "Other") return "var(--series-other)";
   if (key === "unknown" || key.endsWith(`${MODEL_SEPARATOR}unknown`)) return "var(--series-unknown)";
   return SERIES_COLORS[index % SERIES_COLORS.length]!;
 }
@@ -1101,7 +1094,7 @@ function unavailableInputGroup(): PublicInputGroup {
     cadence: { value: null, status: "unavailable", reasons: [] },
     cadenceCoverage: {
       consideredSessions: 0,
-      excluded: { inputHistory: 0, mixedScope: 0, unknownOrigin: 0, noHumanInput: 0, noRecordedWork: 0 },
+      excluded: { inputHistory: 0, mixedScope: 0, noRecordedWork: 0 },
     },
     excluded: { context: 0, replayed: 0, unknownKind: 0, subagent: 0, unknownLane: 0, undated: 0 },
   };
@@ -1117,29 +1110,26 @@ export function renderInputs(snapshot: PublicSnapshot, state: RenderState): HTML
 
   const cadence = group.cadence.value;
   const inputs = group.inputs.value;
-  const humanInputsPerSession = cadence === null ? null : cadence.humanInputs / cadence.sessions;
-  const recordedMinutesPerInput = cadence === null ? null : cadence.recordedWorkMs / 60_000 / cadence.humanInputs;
-  const countedInputs = inputs === null ? 0 : inputs.human + inputs.automated + inputs.unknown;
-  const inputsPerSession = inputs === null || inputs.activeSessions === 0 ? null : countedInputs / inputs.activeSessions;
-  const identifiedOrigin = inputs === null || countedInputs === 0 ? null : (inputs.human + inputs.automated) / countedInputs;
+  const inputsPerMeasuredSession = cadence === null ? null : cadence.inputs / cadence.sessions;
+  const recordedMinutesPerInput = cadence === null ? null : cadence.recordedWorkMs / 60_000 / cadence.inputs;
   const panel = createPanel(
-    "Human direction cadence",
-    "Recorded input frequency and work timing for one matched cohort in the selected period.",
+    "Input cadence",
+    "Submitted input frequency and recorded work timing for one matched cohort in the selected period.",
   );
   const cadenceCards = element("section", "input-cadence-cards");
-  cadenceCards.setAttribute("aria-label", "Human cadence summary");
+  cadenceCards.setAttribute("aria-label", "Input cadence summary");
   cadenceCards.append(
     renderMetricCard(
-      "Human inputs / measured session",
-      humanInputsPerSession === null ? "—" : formatDecimal.format(humanInputsPerSession),
-      "Initial requests are included",
-      "Recorded human submissions divided by measured native sessions in the shared eligible cohort.",
+      "Inputs / measured session",
+      inputsPerMeasuredSession === null ? "—" : formatDecimal.format(inputsPerMeasuredSession),
+      "Initial submissions are included",
+      "Counted submissions divided by measured native sessions in the shared eligible cohort.",
     ),
     renderMetricCard(
-      "Recorded work / human input",
+      "Recorded work / input",
       recordedMinutesPerInput === null ? "—" : `${formatDecimal.format(recordedMinutesPerInput)} min`,
       "Recorded minutes, not elapsed session age",
-      "Recorded native-session working time after the first in-period human input, divided by human inputs in the same measured cohort.",
+      "Recorded native-session working time after the first counted input, divided by inputs in the same measured cohort.",
     ),
   );
   if (group.cadence.status === "partial") {
@@ -1150,132 +1140,29 @@ export function renderInputs(snapshot: PublicSnapshot, state: RenderState): HTML
   panel.body.append(cadenceCards);
 
   const measuredSessions = cadence?.sessions ?? 0;
-  const measuredHumanInputs = cadence?.humanInputs ?? 0;
+  const measuredInputs = cadence?.inputs ?? 0;
   const recordedMinutes = cadence === null ? null : cadence.recordedWorkMs / 60_000;
   panel.body.append(
     element(
       "p",
       "cadence-totals",
       cadence === null
-        ? "— human inputs · — measured sessions · — recorded work"
-        : `${formatInteger.format(measuredHumanInputs)} human inputs · ${formatInteger.format(measuredSessions)} measured ${measuredSessions === 1 ? "session" : "sessions"} · ${formatDecimal.format(recordedMinutes!)} min recorded work`,
+        ? "— inputs · — measured sessions · — recorded work"
+        : `${formatInteger.format(measuredInputs)} inputs · ${formatInteger.format(measuredSessions)} measured ${measuredSessions === 1 ? "session" : "sessions"} · ${formatDecimal.format(recordedMinutes!)} min recorded work`,
     ),
     element(
       "p",
       "cadence-coverage",
-      `${formatInteger.format(measuredSessions)} of ${formatInteger.format(group.cadenceCoverage.consideredSessions)} input-active sessions included`,
+      `${formatInteger.format(measuredSessions)} of ${formatInteger.format(group.cadenceCoverage.consideredSessions)} input-active sessions measured`,
     ),
-  );
-
-  const supporting = element("section", "input-support-grid");
-  supporting.setAttribute("aria-label", "Supporting input counts");
-  const frequency = element("article", "input-support-item");
-  frequency.append(
-    element("h3", undefined, "All inputs / active session"),
-    element("strong", undefined, inputsPerSession === null ? "—" : formatDecimal.format(inputsPerSession)),
-  );
-  const origins = element("article", "input-support-item");
-  origins.append(
-    element("h3", undefined, "Counted input origins"),
     element(
-      "strong",
-      undefined,
+      "p",
+      "input-population",
       inputs === null
-        ? "— human · — automated · — unknown"
-        : `${formatInteger.format(inputs.human)} human · ${formatInteger.format(inputs.automated)} automated · ${formatInteger.format(inputs.unknown)} unknown`,
+        ? "— submitted inputs · — active sessions"
+        : `${formatInteger.format(inputs.inputs)} submitted ${inputs.inputs === 1 ? "input" : "inputs"} · ${formatInteger.format(inputs.activeSessions)} active ${inputs.activeSessions === 1 ? "session" : "sessions"}`,
     ),
   );
-  const coverage = element("article", "input-support-item");
-  coverage.append(
-    element("h3", undefined, "Origin identified"),
-    element("strong", undefined, identifiedOrigin === null ? "—" : formatPercent.format(identifiedOrigin)),
-    element("span", undefined, "of counted inputs"),
-  );
-  supporting.append(frequency, origins, coverage);
-  panel.body.append(
-    supporting,
-    element("p", "panel-note input-explanation", "Fewer human inputs and more recorded work per input can indicate less frequent human direction. They do not prove successful or autonomous work."),
-    element("p", "panel-note", "Both cards use the same measured sessions. Initial requests count; unknown origins and sessions without recorded timing are excluded, not treated as zero."),
-    element("p", "panel-note", "Selected period, not lifetime. Resuming a native session keeps one session; a new native ID counts separately. Work before the first human input in this period is excluded."),
-    element("p", "panel-note", "Timing coverage varies by tool. Recorded work is not total session age, uninterrupted runtime, productive work, or a complete-session timing guarantee."),
-  );
-
-  const disclosure = element("details", "data-disclosure input-disclosure");
-  disclosure.append(element("summary", undefined, "Input and timing coverage"));
-  const exclusionsWrap = element("div", "table-wrap");
-  const exclusionsTable = element("table");
-  exclusionsTable.append(element("caption", "sr-only", "Sessions excluded from the human cadence cohort"));
-  const exclusionsHead = element("thead");
-  const exclusionsHeader = element("tr");
-  for (const label of ["Session exclusion", "Sessions"]) exclusionsHeader.append(element("th", undefined, label));
-  exclusionsHead.append(exclusionsHeader);
-  const exclusionsBody = element("tbody");
-  const sessionExclusions: Array<[string, number]> = [
-    ["Input history", group.cadenceCoverage.excluded.inputHistory],
-    ["Mixed scope", group.cadenceCoverage.excluded.mixedScope],
-    ["Unknown origin", group.cadenceCoverage.excluded.unknownOrigin],
-    ["No human input", group.cadenceCoverage.excluded.noHumanInput],
-    ["No recorded work", group.cadenceCoverage.excluded.noRecordedWork],
-  ];
-  for (const [label, count] of sessionExclusions) {
-    const row = element("tr");
-    row.append(element("td", undefined, label), element("td", undefined, formatInteger.format(count)));
-    exclusionsBody.append(row);
-  }
-  exclusionsTable.append(exclusionsHead, exclusionsBody);
-  exclusionsWrap.append(exclusionsTable);
-
-  const recordsWrap = element("div", "table-wrap");
-  const recordsTable = element("table");
-  recordsTable.append(element("caption", "sr-only", "Input records excluded from supporting counts"));
-  const recordsHead = element("thead");
-  const recordsHeader = element("tr");
-  for (const label of ["Record exclusion", "Records"]) recordsHeader.append(element("th", undefined, label));
-  recordsHead.append(recordsHeader);
-  const recordsBody = element("tbody");
-  const recordExclusions: Array<[string, number]> = [
-    ["Context", group.excluded.context],
-    ["Replayed", group.excluded.replayed],
-    ["Unknown kind", group.excluded.unknownKind],
-    ["Subagent", group.excluded.subagent],
-    ["Unknown lane", group.excluded.unknownLane],
-    ["Undated", group.excluded.undated],
-  ];
-  for (const [label, count] of recordExclusions) {
-    const row = element("tr");
-    row.append(element("td", undefined, label), element("td", undefined, formatInteger.format(count)));
-    recordsBody.append(row);
-  }
-  recordsTable.append(recordsHead, recordsBody);
-  recordsWrap.append(recordsTable);
-
-  const sourcesWrap = element("div", "table-wrap");
-  const sourcesTable = element("table");
-  sourcesTable.append(element("caption", "sr-only", "Per-harness input and recorded-work timing status"));
-  const sourcesHead = element("thead");
-  const sourcesHeader = element("tr");
-  for (const label of ["Harness", "Input status", "Timing status"]) sourcesHeader.append(element("th", undefined, label));
-  sourcesHead.append(sourcesHeader);
-  const sourcesBody = element("tbody");
-  const disclosureEntries = [...range.byHarness];
-  if (state.options.harness !== "all" && selectedEntry === undefined) {
-    disclosureEntries.push({ harness: state.options.harness, group });
-    disclosureEntries.sort((left, right) => AGENT_VALUES.indexOf(left.harness) - AGENT_VALUES.indexOf(right.harness));
-  }
-  for (const entry of disclosureEntries) {
-    const timing = snapshot.sources.find((source) => source.agent === entry.harness)?.work ?? "unavailable";
-    const row = element("tr");
-    row.append(
-      element("td", undefined, entry.harness),
-      element("td", undefined, entry.group.inputs.status[0]!.toUpperCase() + entry.group.inputs.status.slice(1)),
-      element("td", undefined, timing[0]!.toUpperCase() + timing.slice(1)),
-    );
-    sourcesBody.append(row);
-  }
-  sourcesTable.append(sourcesHead, sourcesBody);
-  sourcesWrap.append(sourcesTable);
-  disclosure.append(exclusionsWrap, recordsWrap, sourcesWrap);
-  panel.body.append(disclosure);
   return panel.root;
 }
 
@@ -1675,12 +1562,12 @@ export function renderDashboard(root: HTMLElement, snapshot: PublicSnapshot, ini
     dashboard.dataset.harness = state.options.harness;
     dashboard.append(renderToolbar(snapshot, state, draw));
     if (["all", "uptime", "concurrency", "agent-hours"].includes(state.options.view)) dashboard.append(renderCards(days, state, state.options.view));
-    if (state.options.view === "all") dashboard.append(renderInputs(snapshot, state));
     if (shouldRender(state.options.view, "calendar")) dashboard.append(renderCalendar(days, state, false));
     if (state.options.view === "commits") dashboard.append(renderCalendar(days, state, true));
     if (shouldRender(state.options.view, "models")) dashboard.append(renderModels(days, state, draw));
     if (shouldRender(state.options.view, "parallelism")) dashboard.append(renderParallelism(days, state, state.options.view === "parallelism"));
     if (shouldRender(state.options.view, "rhythm")) dashboard.append(renderRhythm(days, state, snapshot.timezone, state.options.view === "rhythm", draw));
+    if (state.options.view === "all") dashboard.append(renderInputs(snapshot, state));
     if (shouldRender(state.options.view, "cache")) dashboard.append(renderCache(days, state, state.options.view === "cache", draw));
     if (shouldRender(state.options.view, "cost")) dashboard.append(renderCost(days, state, snapshot.pricing, state.options.view === "cost", draw));
     dashboard.append(renderDataTable(days, state), renderFooter(snapshot));

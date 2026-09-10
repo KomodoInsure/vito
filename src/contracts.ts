@@ -148,33 +148,29 @@ export interface PublicWorkGroup {
 }
 
 export interface InputStats {
-  human: number;
-  automated: number;
-  unknown: number;
+  inputs: number;
   activeSessions: number;
 }
 
-export interface HumanCadenceStats {
+export interface InputCadenceStats {
   sessions: number;
-  humanInputs: number;
+  inputs: number;
   recordedWorkMs: number;
 }
 
-export interface HumanCadenceCoverage {
+export interface InputCadenceCoverage {
   consideredSessions: number;
   excluded: {
     inputHistory: number;
     mixedScope: number;
-    unknownOrigin: number;
-    noHumanInput: number;
     noRecordedWork: number;
   };
 }
 
 export interface PublicInputGroup {
   inputs: Metric<InputStats>;
-  cadence: Metric<HumanCadenceStats>;
-  cadenceCoverage: HumanCadenceCoverage;
+  cadence: Metric<InputCadenceStats>;
+  cadenceCoverage: InputCadenceCoverage;
   excluded: {
     context: number;
     replayed: number;
@@ -224,7 +220,7 @@ export interface PublicDay {
 }
 
 export interface PublicSnapshot {
-  schemaVersion: 5;
+  schemaVersion: 6;
   pricing: {
     asOf: string;
     basis: "standard-api";
@@ -513,28 +509,23 @@ export const publicWorkGroupSchema = z
 
 const inputStatsSchema = z
   .object({
-    human: nonnegativeSafeIntegerSchema,
-    automated: nonnegativeSafeIntegerSchema,
-    unknown: nonnegativeSafeIntegerSchema,
+    inputs: nonnegativeSafeIntegerSchema,
     activeSessions: nonnegativeSafeIntegerSchema,
   })
   .strict()
   .superRefine((stats, context) => {
-    const total = stats.human + stats.automated + stats.unknown;
-    if (!Number.isSafeInteger(total)) {
-      context.addIssue({ code: "custom", message: "Input total must be a safe integer" });
-    } else if (total < stats.activeSessions) {
+    if (stats.inputs < stats.activeSessions) {
       context.addIssue({ code: "custom", path: ["activeSessions"], message: "Active sessions cannot exceed counted inputs" });
     }
-    if ((total === 0) !== (stats.activeSessions === 0)) {
+    if ((stats.inputs === 0) !== (stats.activeSessions === 0)) {
       context.addIssue({ code: "custom", path: ["activeSessions"], message: "Known-empty inputs and active sessions must be zero together" });
     }
   });
 
-const humanCadenceStatsSchema = z
+const inputCadenceStatsSchema = z
   .object({
     sessions: nonnegativeSafeIntegerSchema,
-    humanInputs: nonnegativeSafeIntegerSchema,
+    inputs: nonnegativeSafeIntegerSchema,
     recordedWorkMs: nonnegativeSafeIntegerSchema,
   })
   .strict()
@@ -542,8 +533,8 @@ const humanCadenceStatsSchema = z
     if (stats.sessions === 0) {
       context.addIssue({ code: "custom", path: ["sessions"], message: "Measured cadence requires a positive session count" });
     }
-    if (stats.humanInputs < stats.sessions) {
-      context.addIssue({ code: "custom", path: ["humanInputs"], message: "Each measured session requires a human input" });
+    if (stats.inputs < stats.sessions) {
+      context.addIssue({ code: "custom", path: ["inputs"], message: "Each measured session requires a counted input" });
     }
     if (stats.recordedWorkMs === 0) {
       context.addIssue({ code: "custom", path: ["recordedWorkMs"], message: "Measured cadence requires positive recorded work" });
@@ -558,7 +549,7 @@ const inputMetricSchema = metricSchema(inputStatsSchema).superRefine((entry, con
   }
 });
 
-const humanCadenceMetricSchema = metricSchema(humanCadenceStatsSchema).superRefine((entry, context) => {
+const inputCadenceMetricSchema = metricSchema(inputCadenceStatsSchema).superRefine((entry, context) => {
   if (entry.value === null && entry.status !== "unavailable") {
     context.addIssue({ code: "custom", path: ["status"], message: "An empty cadence cohort must be unavailable" });
   } else if (entry.value !== null && entry.status === "unavailable") {
@@ -570,8 +561,6 @@ const cadenceExcludedSchema = z
   .object({
     inputHistory: nonnegativeSafeIntegerSchema,
     mixedScope: nonnegativeSafeIntegerSchema,
-    unknownOrigin: nonnegativeSafeIntegerSchema,
-    noHumanInput: nonnegativeSafeIntegerSchema,
     noRecordedWork: nonnegativeSafeIntegerSchema,
   })
   .strict();
@@ -597,7 +586,7 @@ const inputExcludedSchema = z
 const publicInputGroupSchema = z
   .object({
     inputs: inputMetricSchema,
-    cadence: humanCadenceMetricSchema,
+    cadence: inputCadenceMetricSchema,
     cadenceCoverage: cadenceCoverageSchema,
     excluded: inputExcludedSchema,
   })
@@ -612,7 +601,7 @@ const publicInputGroupSchema = z
     if (!Number.isSafeInteger(classified) || classified !== group.cadenceCoverage.consideredSessions) {
       context.addIssue({ code: "custom", path: ["cadenceCoverage", "excluded"], message: "Every considered session must be classified exactly once" });
     }
-    if (cadence !== null && (inputs === null || cadence.humanInputs > inputs.human || cadence.sessions > inputs.activeSessions)) {
+    if (cadence !== null && (inputs === null || cadence.inputs > inputs.inputs || cadence.sessions > inputs.activeSessions)) {
       context.addIssue({ code: "custom", path: ["cadence"], message: "Cadence cohort cannot exceed its supporting input population" });
     }
   });
@@ -624,9 +613,9 @@ const publicInputHarnessSchema = z
   })
   .strict();
 
-const INPUT_COUNTER_KEYS = ["human", "automated", "unknown", "activeSessions"] as const;
-const CADENCE_COUNTER_KEYS = ["sessions", "humanInputs", "recordedWorkMs"] as const;
-const CADENCE_EXCLUDED_KEYS = ["inputHistory", "mixedScope", "unknownOrigin", "noHumanInput", "noRecordedWork"] as const;
+const INPUT_COUNTER_KEYS = ["inputs", "activeSessions"] as const;
+const CADENCE_COUNTER_KEYS = ["sessions", "inputs", "recordedWorkMs"] as const;
+const CADENCE_EXCLUDED_KEYS = ["inputHistory", "mixedScope", "noRecordedWork"] as const;
 const INPUT_EXCLUDED_KEYS = ["context", "replayed", "unknownKind", "subagent", "unknownLane", "undated"] as const;
 
 function safeCounterSum(values: readonly number[]): number | null {
@@ -771,7 +760,7 @@ const publicSourceSchema = z
 
 export const publicSnapshotSchema: z.ZodType<PublicSnapshot> = z
   .object({
-    schemaVersion: z.literal(5),
+    schemaVersion: z.literal(6),
     pricing: z
       .object({
         asOf: publicDateSchema,

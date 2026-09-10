@@ -62,13 +62,13 @@ function publicSnapshot(at: string): PublicSnapshot {
     cadence: { value: null, status: "unavailable" as const, reasons: [] },
     cadenceCoverage: {
       consideredSessions: 0,
-      excluded: { inputHistory: 0, mixedScope: 0, unknownOrigin: 0, noHumanInput: 0, noRecordedWork: 0 },
+      excluded: { inputHistory: 0, mixedScope: 0, noRecordedWork: 0 },
     },
     excluded: { context: 0, replayed: 0, unknownKind: 0, subagent: 0, unknownLane: 0, undated: 0 },
   });
   const range = () => ({ all: group(), byHarness: [] });
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     pricing: { ...PRICING_METADATA, sources: [...PRICING_METADATA.sources] },
     organization: "Komodo Risk Inc",
     timezone: "UTC",

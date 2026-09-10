@@ -297,14 +297,14 @@ describe("configuration initialization", () => {
 describe("public contract safety", () => {
   const emptyInputGroup = () => ({
     inputs: {
-      value: { human: 0, automated: 0, unknown: 0, activeSessions: 0 },
+      value: { inputs: 0, activeSessions: 0 },
       status: "recorded" as const,
       reasons: [],
     },
     cadence: { value: null, status: "unavailable" as const, reasons: [] },
     cadenceCoverage: {
       consideredSessions: 0,
-      excluded: { inputHistory: 0, mixedScope: 0, unknownOrigin: 0, noHumanInput: 0, noRecordedWork: 0 },
+      excluded: { inputHistory: 0, mixedScope: 0, noRecordedWork: 0 },
     },
     excluded: { context: 0, replayed: 0, unknownKind: 0, subagent: 0, unknownLane: 0, undated: 0 },
   });
@@ -314,7 +314,7 @@ describe("public contract safety", () => {
   });
 
   const snapshot = {
-    schemaVersion: 5 as const,
+    schemaVersion: 6 as const,
     pricing: { ...PRICING_METADATA, sources: [...PRICING_METADATA.sources] },
     organization: "Komodo Risk Inc" as const,
     timezone: "UTC",
@@ -347,7 +347,7 @@ describe("public contract safety", () => {
     days: [],
   };
 
-  test("accepts only schema 5 with all exact input ranges", () => {
+  test("accepts only schema 6 with all exact input ranges", () => {
     expect(publicSnapshotSchema.safeParse(snapshot).success).toBe(true);
     const missing = structuredClone(snapshot) as Record<string, unknown>;
     delete (missing.inputRanges as Record<string, unknown>)["90"];
@@ -366,7 +366,7 @@ describe("public contract safety", () => {
     expect(publicSnapshotSchema.safeParse(privateValue).success).toBe(false);
 
     const inconsistent = structuredClone(snapshot);
-    inconsistent.inputRanges["7"].all.inputs.value = { human: 0, automated: 0, unknown: 0, activeSessions: 1 };
+    inconsistent.inputRanges["7"].all.inputs.value = { inputs: 0, activeSessions: 1 };
     expect(publicSnapshotSchema.safeParse(inconsistent).success).toBe(false);
 
     const unsafe = structuredClone(snapshot);
@@ -375,7 +375,7 @@ describe("public contract safety", () => {
 
     const positiveWithoutCohort = structuredClone(snapshot) as unknown as PublicSnapshot;
     positiveWithoutCohort.inputRanges["7"].all.cadence = {
-      value: { sessions: 0, humanInputs: 1, recordedWorkMs: 1 },
+      value: { sessions: 0, inputs: 1, recordedWorkMs: 1 },
       status: "recorded",
       reasons: [],
     };

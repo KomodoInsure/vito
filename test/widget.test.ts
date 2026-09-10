@@ -9,6 +9,7 @@ import {
   isPublicSnapshot,
   inferenceStreaks,
   parseWidgetOptions,
+  renderDashboard,
   renderInputs,
   SUPPORTED_VIEWS,
 } from "../web/widget";
@@ -75,13 +76,11 @@ function day(date: string, rows: PublicDay["usageRows"], companyUsage: PublicUsa
 }
 
 function inputGroup(
-  values: { human: number; automated: number; unknown: number; activeSessions: number } | null = {
-    human: 0,
-    automated: 0,
-    unknown: 0,
+  values: { inputs: number; activeSessions: number } | null = {
+    inputs: 0,
     activeSessions: 0,
   },
-  cadence: { sessions: number; humanInputs: number; recordedWorkMs: number } | null = null,
+  cadence: { sessions: number; inputs: number; recordedWorkMs: number } | null = null,
   status: Metric<unknown>["status"] = values === null ? "unavailable" : "recorded",
 ): PublicInputGroup {
   const sessions = values?.activeSessions ?? 0;
@@ -98,8 +97,6 @@ function inputGroup(
       excluded: {
         inputHistory: sessions - measured,
         mixedScope: 0,
-        unknownOrigin: 0,
-        noHumanInput: 0,
         noRecordedWork: 0,
       },
     },
@@ -115,7 +112,7 @@ function inputRanges(group = inputGroup()): PublicSnapshot["inputRanges"] {
 function snapshotFixture(ranges: PublicSnapshot["inputRanges"] = inputRanges()): PublicSnapshot {
   const unavailable = workGroup(unavailableWork());
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     pricing: { asOf: "2026-09-06", basis: "standard-api", sources: ["https://openai.com/api/pricing/"] },
     organization: "Komodo Risk Inc",
     timezone: "UTC",
@@ -139,9 +136,18 @@ function snapshotFixture(ranges: PublicSnapshot["inputRanges"] = inputRanges()):
 class TestElement {
   readonly tagName: string;
   className = "";
+  classList = { add: (...names: string[]) => { this.className = [this.className, ...names].filter(Boolean).join(" "); } };
   dataset: Record<string, string> = {};
+  style: Record<string, string> = {};
   children: Array<TestElement | string> = [];
   attributes: Record<string, string> = {};
+  hidden = false;
+  value = "";
+  selected = false;
+  type = "";
+  href = "";
+  target = "";
+  rel = "";
   private ownText = "";
 
   constructor(tagName: string) {
@@ -161,8 +167,19 @@ class TestElement {
     this.children.push(...children);
   }
 
+  replaceChildren(...children: Array<TestElement | string>): void {
+    this.ownText = "";
+    this.children = children;
+  }
+
+  addEventListener(): void {}
+
   setAttribute(name: string, value: string): void {
     this.attributes[name] = value;
+  }
+
+  removeAttribute(name: string): void {
+    delete this.attributes[name];
   }
 }
 
@@ -185,6 +202,37 @@ function renderInputText(snapshot: PublicSnapshot, range: 7 | 30 | 90 | 365, har
       chartMounts: [],
     } as never) as unknown as TestElement;
     return rendered.textContent;
+  } finally {
+    Object.assign(globalThis, { document: previousDocument });
+  }
+}
+
+function renderDashboardText(snapshot: PublicSnapshot): string {
+  const previousDocument = globalThis.document;
+  const documentElement = new TestElement("html");
+  Object.assign(globalThis, {
+    document: {
+      documentElement,
+      createElement(tag: string) {
+        return new TestElement(tag);
+      },
+      createElementNS(_namespace: string, tag: string) {
+        return new TestElement(tag);
+      },
+      createTextNode(text: string) {
+        return text;
+      },
+    },
+  });
+  try {
+    const root = new TestElement("main");
+    renderDashboard(root as unknown as HTMLElement, snapshot, {
+      view: "all",
+      range: 7,
+      theme: "auto",
+      harness: "all",
+    });
+    return root.textContent;
   } finally {
     Object.assign(globalThis, { document: previousDocument });
   }
@@ -300,30 +348,34 @@ describe("widget aggregates", () => {
   });
 
 
-  test("selects six leading models, keeps unknown separate, and rolls the remainder into Other", () => {
+  test("keeps every model with positive tokens in the selected range explicit", () => {
     const rows = [
       row("codex", "p", "m1", 80), row("codex", "p", "m2", 70), row("codex", "p", "m3", 60),
       row("codex", "p", "m4", 50), row("codex", "p", "m5", 40), row("codex", "p", "m6", 30),
-      row("codex", "p", "m7", 20), row("codex", "p", "unknown", 10),
+      row("omp", "openai-codex", "gpt-6-astra", 20), row("codex", "p", "zero", 0),
     ];
-    const series = buildUsageSeries([day("2026-09-06", rows, usage(360), workGroup(unavailableWork()))], "all", "model");
-    expect(series.keys).toEqual(["p · m1", "p · m2", "p · m3", "p · m4", "p · m5", "p · m6", "Other", "p · unknown"]);
-    expect(series.values[0]?.values.Other).toBe(20);
-    expect(series.values[0]?.fullTotal).toBe(360);
+    const missing = row("codex", "p", "missing", 0);
+    missing.usage = usage(null);
+    const series = buildUsageSeries([
+      day("2026-09-05", [rows[0]!, missing], usage(80), workGroup(unavailableWork())),
+      day("2026-09-06", rows.slice(1), usage(270), workGroup(unavailableWork())),
+    ], "all", "model");
+    expect(series.keys).toEqual([
+      "p · m1", "p · m2", "p · m3", "p · m4", "p · m5", "p · m6", "openai-codex · gpt-6-astra",
+    ]);
+    expect(series.values[0]?.values["openai-codex · gpt-6-astra"]).toBe(0);
+    expect(series.values[1]?.values["openai-codex · gpt-6-astra"]).toBe(20);
   });
 
   test("keeps explicit missing token observations as chart gaps rather than zero", () => {
-    const missing = row("codex", "p", "unknown", 0);
-    missing.usage = usage(null);
     const known = row("codex", "p", "known", 12);
     const days = [
-      day("2026-09-05", [known, missing], usage(12), workGroup(unavailableWork())),
+      day("2026-09-05", [known], usage(12), workGroup(unavailableWork())),
       day("2026-09-06", [], usage(null), workGroup(unavailableWork())),
     ];
     const series = buildUsageSeries(days, "all", "model");
-    expect(series.keys).toContain("p · unknown");
-    expect(series.values[0]?.values).toEqual({ "p · known": 12, "p · unknown": null });
-    expect(series.values[1]?.values).toEqual({ "p · known": null, "p · unknown": null });
+    expect(series.values[0]?.values).toEqual({ "p · known": 12 });
+    expect(series.values[1]?.values).toEqual({ "p · known": null });
     expect(series.values[1]?.fullTotal).toBeNull();
   });
 
@@ -340,31 +392,29 @@ describe("widget aggregates", () => {
 });
 
 
-describe("human input cadence panel", () => {
-  test("renders the selected precomputed cohort, neutral explanation, and complete disclosure", () => {
+describe("input cadence panel", () => {
+  test("renders submitted-input cadence without a bottom qualification", () => {
     const codex = inputGroup(
-      { human: 3, automated: 9, unknown: 1, activeSessions: 3 },
-      { sessions: 2, humanInputs: 3, recordedWorkMs: 1_200_000 },
+      { inputs: 4, activeSessions: 3 },
+      { sessions: 2, inputs: 3, recordedWorkMs: 1_200_000 },
       "partial",
     );
     codex.cadenceCoverage.excluded.inputHistory = 0;
-    codex.cadenceCoverage.excluded.unknownOrigin = 1;
-    const claude = inputGroup({ human: 1, automated: 0, unknown: 0, activeSessions: 1 }, null, "partial");
+    codex.cadenceCoverage.excluded.noRecordedWork = 1;
+    const claude = inputGroup({ inputs: 1, activeSessions: 1 }, null, "partial");
     claude.cadenceCoverage.excluded.inputHistory = 0;
     claude.cadenceCoverage.excluded.noRecordedWork = 1;
     claude.cadence.reasons = ["timing-unavailable"];
     const all = inputGroup(
-      { human: 4, automated: 9, unknown: 1, activeSessions: 4 },
-      { sessions: 2, humanInputs: 3, recordedWorkMs: 1_200_000 },
+      { inputs: 5, activeSessions: 4 },
+      { sessions: 2, inputs: 3, recordedWorkMs: 1_200_000 },
       "partial",
     );
     all.cadenceCoverage.excluded.inputHistory = 0;
-    all.cadenceCoverage.excluded.unknownOrigin = 1;
-    all.cadenceCoverage.excluded.noRecordedWork = 1;
-    all.excluded.context = 1;
+    all.cadenceCoverage.excluded.noRecordedWork = 2;
     const thirty = inputGroup(
-      { human: 2, automated: 0, unknown: 0, activeSessions: 1 },
-      { sessions: 1, humanInputs: 2, recordedWorkMs: 600_000 },
+      { inputs: 2, activeSessions: 1 },
+      { sessions: 1, inputs: 2, recordedWorkMs: 600_000 },
     );
     const ranges: PublicSnapshot["inputRanges"] = {
       "7": { all, byHarness: [{ harness: "codex", group: codex }, { harness: "claude", group: claude }] },
@@ -380,42 +430,45 @@ describe("human input cadence panel", () => {
 
     const sevenDayAll = renderInputText(snapshot, 7, "all");
     for (const text of [
-      "Human inputs / measured session",
-      "Recorded work / human input",
+      "Inputs / measured session",
+      "Recorded work / input",
       "1.5",
       "6.67 min",
-      "3 human inputs · 2 measured sessions · 20 min recorded work",
-      "2 of 4 input-active sessions included",
-      "All inputs / active session",
-      "3.5",
-      "4 human · 9 automated · 1 unknown",
-      "Origin identified",
-      "92.9%",
+      "3 inputs · 2 measured sessions · 20 min recorded work",
+      "2 of 4 input-active sessions measured",
+      "5 submitted inputs · 4 active sessions",
       "Partial cadence",
-      "Fewer human inputs and more recorded work per input can indicate less frequent human direction. They do not prove successful or autonomous work.",
-      "Both cards use the same measured sessions. Initial requests count; unknown origins and sessions without recorded timing are excluded, not treated as zero.",
-      "Selected period, not lifetime. Resuming a native session keeps one session; a new native ID counts separately. Work before the first human input in this period is excluded.",
-      "Timing coverage varies by tool. Recorded work is not total session age, uninterrupted runtime, productive work, or a complete-session timing guarantee.",
-      "Unknown origin1",
-      "No recorded work1",
-      "Context1",
-      "claude",
-      "Unavailable",
     ]) expect(sevenDayAll).toContain(text);
+    for (const text of [
+      "Human inputs",
+      "Origin identified",
+      "Input and timing coverage",
+      "Measures submitted direction, including automated inputs—not human effort or successful work.",
+    ]) expect(sevenDayAll).not.toContain(text);
 
     const thirtyDayCodex = renderInputText(snapshot, 30, "codex");
-    expect(thirtyDayCodex).toContain("2 human inputs · 1 measured session · 10 min recorded work");
+    expect(thirtyDayCodex).toContain("2 inputs · 1 measured session · 10 min recorded work");
     expect(thirtyDayCodex).toContain("5 min");
 
     const claudeOnly = renderInputText(snapshot, 7, "claude");
     expect(claudeOnly).toContain("—");
-    expect(claudeOnly).toContain("1 human · 0 automated · 0 unknown");
+    expect(claudeOnly).toContain("1 submitted input · 1 active session");
+  });
+
+  test("places input cadence immediately after the work rhythm visualization", () => {
+    const rendered = renderDashboardText(snapshotFixture());
+    const rhythm = rendered.indexOf("Work rhythm");
+    const cadence = rendered.indexOf("Input cadence");
+    const cache = rendered.indexOf("Cache-read share");
+    expect(rhythm).toBeGreaterThanOrEqual(0);
+    expect(cadence).toBeGreaterThan(rhythm);
+    expect(cadence).toBeLessThan(cache);
   });
 
   test("renders unavailable data when a globally valid harness has no group in the selected range", () => {
     const ranges = inputRanges();
     const retainedClaude = inputGroup(
-      { human: 1, automated: 0, unknown: 0, activeSessions: 1 },
+      { inputs: 1, activeSessions: 1 },
       null,
       "partial",
     );
@@ -433,12 +486,12 @@ describe("human input cadence panel", () => {
 
     const retainedOnlyInLongerRange = renderInputText(snapshot, 7, "claude");
     expect(retainedOnlyInLongerRange).toContain("Cadence unavailable");
-    expect(retainedOnlyInLongerRange).toContain("— human · — automated · — unknown");
-    expect(retainedOnlyInLongerRange).toContain("claudeUnavailableUnavailable");
+    expect(retainedOnlyInLongerRange).toContain("— submitted inputs · — active sessions");
+    expect(retainedOnlyInLongerRange).not.toContain("claudeUnavailableUnavailable");
 
     const accountingOnly = renderInputText(snapshot, 7, "omp");
     expect(accountingOnly).toContain("Cadence unavailable");
-    expect(accountingOnly).toContain("ompUnavailableRecorded");
+    expect(accountingOnly).not.toContain("ompUnavailableRecorded");
   });
 });
 describe("public DOM safety boundary", () => {
@@ -465,7 +518,7 @@ describe("public DOM safety boundary", () => {
     delete missingRange.inputRanges["90"];
     expect(isPublicSnapshot(missingRange)).toBe(false);
     const inconsistent = structuredClone(fixture);
-    inconsistent.inputRanges["7"].all.inputs.value = { human: 0, automated: 0, unknown: 0, activeSessions: 1 };
+    inconsistent.inputRanges["7"].all.inputs.value = { inputs: 0, activeSessions: 1 };
     expect(isPublicSnapshot(inconsistent)).toBe(false);
     const privateInput = structuredClone(fixture) as PublicSnapshot & { inputRanges: { "7": { all: PublicInputGroup & { controller: string } } } };
     const unsafeInput = structuredClone(fixture);
@@ -473,7 +526,7 @@ describe("public DOM safety boundary", () => {
     expect(isPublicSnapshot(unsafeInput)).toBe(false);
     const positiveWithoutCohort = structuredClone(fixture);
     positiveWithoutCohort.inputRanges["7"].all.cadence = {
-      value: { sessions: 0, humanInputs: 1, recordedWorkMs: 1 },
+      value: { sessions: 0, inputs: 1, recordedWorkMs: 1 },
       status: "recorded",
       reasons: [],
     };
