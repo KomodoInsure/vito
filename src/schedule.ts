@@ -7,6 +7,7 @@ import {
   mkdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -131,7 +132,14 @@ function resolveExistingPath(path: string, label: string, kind: "file" | "direct
 function resolveExecutable(path: string | undefined, command: string, label: string): string {
   const candidate = path ?? Bun.which(command);
   if (candidate === null || candidate === undefined) fail(`${label} executable was not found in PATH.`);
-  return resolveExistingPath(candidate, label, "file");
+  if (!isAbsolute(candidate)) fail(`${label} executable path must be absolute: ${candidate}`);
+  try {
+    if (!statSync(candidate).isFile()) fail(`${label} executable must be a file: ${candidate}`);
+  } catch (error) {
+    if (error instanceof ScheduleError) throw error;
+    fail(`${label} executable does not exist: ${candidate}`);
+  }
+  return candidate;
 }
 
 function resolveUid(uid: number | undefined): number {
@@ -143,7 +151,7 @@ function resolveUid(uid: number | undefined): number {
 }
 
 function resolveSchedule(config: Config, configPath: string, options: ScheduleOptions): ResolvedSchedule {
-  const bunPath = resolveExecutable(options.bunPath ?? process.execPath, "bun", "Bun");
+  const bunPath = resolveExecutable(options.bunPath, "bun", "Bun");
   const gitPath = resolveExecutable(options.gitPath, "git", "Git");
   const ghPath = resolveExecutable(options.ghPath, "gh", "GitHub CLI");
   const launchctlPath = resolveExecutable(options.launchctlPath, "launchctl", "launchctl");
@@ -198,11 +206,24 @@ function uniqueDirectories(paths: readonly string[]): string[] {
   return result;
 }
 
-function renderResolvedPlist(resolved: ResolvedSchedule): string {
+interface PlistRenderOptions {
+  canonicalExecutables?: boolean;
+  startIntervalSeconds?: number;
+}
+
+function renderResolvedPlist(
+  resolved: ResolvedSchedule,
+  options: PlistRenderOptions = {},
+): string {
+  const canonicalExecutables = options.canonicalExecutables ?? false;
+  const startIntervalSeconds = options.startIntervalSeconds ?? 15 * 60;
+  const bunPath = canonicalExecutables ? realpathSync(resolved.bunPath) : resolved.bunPath;
+  const gitPath = canonicalExecutables ? realpathSync(resolved.gitPath) : resolved.gitPath;
+  const ghPath = canonicalExecutables ? realpathSync(resolved.ghPath) : resolved.ghPath;
   const cliPath = join(resolved.projectDir, "src", "cli.ts");
   if (!existsSync(cliPath) || !statSync(cliPath).isFile()) fail(`Vito CLI entry point does not exist: ${cliPath}`);
-  const path = uniqueDirectories([resolved.bunPath, resolved.gitPath, resolved.ghPath]).join(":");
-  const argumentsList = [resolved.bunPath, "run", cliPath, "--config", resolved.configPath, "tick"];
+  const path = uniqueDirectories([bunPath, gitPath, ghPath]).join(":");
+  const argumentsList = [bunPath, "run", cliPath, "--config", resolved.configPath, "tick"];
   const argumentsXml = argumentsList.map((argument) => `      <string>${xml(argument)}</string>`).join("\n");
 
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -216,7 +237,7 @@ function renderResolvedPlist(resolved: ResolvedSchedule): string {
 ${argumentsXml}
     </array>
     <key>StartInterval</key>
-    <integer>60</integer>
+    <integer>${startIntervalSeconds}</integer>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
@@ -261,11 +282,44 @@ function ensureLaunchAgentDirectory(path: string): void {
   }
 }
 
-function inspectManagedPlist(path: string, expected: string): { installed: boolean; managed: boolean } {
-  if (!existsSync(path)) return { installed: false, managed: false };
+interface ManagedPlistInspection {
+  installed: boolean;
+  managed: boolean;
+  current: boolean;
+  content: string | null;
+}
+
+function normalizeLegacyExecutableLocations(content: string): string | null {
+  const programPattern = /(<key>ProgramArguments<\/key>\n    <array>\n      <string>)[^<\r\n]+(<\/string>)/g;
+  const pathPattern = /(<key>PATH<\/key>\n      <string>)[^<\r\n]+(<\/string>)/g;
+  if ([...content.matchAll(programPattern)].length !== 1 || [...content.matchAll(pathPattern)].length !== 1) {
+    return null;
+  }
+  return content
+    .replace(programPattern, "$1__VITO_EXECUTABLE__$2")
+    .replace(pathPattern, "$1__VITO_EXECUTABLE_PATH__$2");
+}
+
+function inspectManagedPlist(
+  path: string,
+  expected: string,
+  legacyExpected?: string,
+): ManagedPlistInspection {
+  if (!existsSync(path)) return { installed: false, managed: false, current: false, content: null };
   const metadata = lstatSync(path);
-  if (metadata.isSymbolicLink() || !metadata.isFile()) return { installed: true, managed: false };
-  return { installed: true, managed: readFileSync(path, "utf8") === expected };
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    return { installed: true, managed: false, current: false, content: null };
+  }
+  const content = readFileSync(path, "utf8");
+  const normalizedContent = normalizeLegacyExecutableLocations(content);
+  const normalizedLegacy = legacyExpected === undefined ? null : normalizeLegacyExecutableLocations(legacyExpected);
+  return {
+    installed: true,
+    managed: content === expected
+      || (normalizedContent !== null && normalizedLegacy !== null && normalizedContent === normalizedLegacy),
+    current: content === expected,
+    content,
+  };
 }
 
 async function runLaunchctl(resolved: ResolvedSchedule, args: readonly string[]): Promise<CommandResult> {
@@ -306,6 +360,23 @@ function writeManagedPlist(path: string, content: string): void {
   }
 }
 
+function replaceManagedPlist(path: string, previous: string, content: string): void {
+  const temporary = `${path}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    writeFileSync(temporary, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    chmodSync(temporary, 0o600);
+    if (readFileSync(path, "utf8") !== previous) {
+      fail(`Refusing to replace a LaunchAgent plist that changed during installation: ${path}`);
+    }
+    renameSync(temporary, path);
+  } catch (error) {
+    if (error instanceof ScheduleError) throw error;
+    fail(`Unable to replace managed LaunchAgent plist: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
 export async function installSchedule(
   config: Config,
   configPath: string,
@@ -313,7 +384,11 @@ export async function installSchedule(
 ): Promise<ScheduleInstallResult> {
   const resolved = resolveSchedule(config, configPath, options);
   const expected = renderResolvedPlist(resolved);
-  const inspection = inspectManagedPlist(resolved.plistPath, expected);
+  const legacyExpected = renderResolvedPlist(resolved, {
+    canonicalExecutables: true,
+    startIntervalSeconds: 60,
+  });
+  const inspection = inspectManagedPlist(resolved.plistPath, expected, legacyExpected);
   if (inspection.installed && !inspection.managed) {
     fail(`Refusing to replace an unrelated or modified LaunchAgent plist: ${resolved.plistPath}`);
   }
@@ -323,6 +398,17 @@ export async function installSchedule(
     writeManagedPlist(resolved.plistPath, expected);
     const result = await runLaunchctl(resolved, ["bootstrap", `gui/${resolved.uid}`, resolved.plistPath]);
     if (result.exitCode !== 0) commandFailure("bootstrap", result);
+    return { label: SCHEDULE_LABEL, plistPath: resolved.plistPath, installed: true, bootstrapped: true };
+  }
+
+  if (!inspection.current) {
+    if (await isLoaded(resolved)) {
+      const bootout = await runLaunchctl(resolved, ["bootout", `gui/${resolved.uid}`, resolved.plistPath]);
+      if (bootout.exitCode !== 0) commandFailure("bootout", bootout);
+    }
+    replaceManagedPlist(resolved.plistPath, inspection.content!, expected);
+    const bootstrap = await runLaunchctl(resolved, ["bootstrap", `gui/${resolved.uid}`, resolved.plistPath]);
+    if (bootstrap.exitCode !== 0) commandFailure("bootstrap", bootstrap);
     return { label: SCHEDULE_LABEL, plistPath: resolved.plistPath, installed: true, bootstrapped: true };
   }
 
@@ -395,7 +481,11 @@ export async function scheduleStatus(
 ): Promise<ScheduleStatus> {
   const resolved = resolveSchedule(config, configPath, options);
   const expected = renderResolvedPlist(resolved);
-  const inspection = inspectManagedPlist(resolved.plistPath, expected);
+  const legacyExpected = renderResolvedPlist(resolved, {
+    canonicalExecutables: true,
+    startIntervalSeconds: 60,
+  });
+  const inspection = inspectManagedPlist(resolved.plistPath, expected, legacyExpected);
   const publication = readPublicationState(config);
   return {
     label: SCHEDULE_LABEL,
@@ -416,7 +506,11 @@ export async function uninstallSchedule(
 ): Promise<ScheduleUninstallResult> {
   const resolved = resolveSchedule(config, configPath, options);
   const expected = renderResolvedPlist(resolved);
-  const inspection = inspectManagedPlist(resolved.plistPath, expected);
+  const legacyExpected = renderResolvedPlist(resolved, {
+    canonicalExecutables: true,
+    startIntervalSeconds: 60,
+  });
+  const inspection = inspectManagedPlist(resolved.plistPath, expected, legacyExpected);
   if (!inspection.installed) {
     return { label: SCHEDULE_LABEL, plistPath: resolved.plistPath, removed: false, bootedOut: false };
   }

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { Temporal } from "@js-temporal/polyfill";
 
 import { type Config } from "./config";
@@ -998,10 +1000,47 @@ function buildInputRanges(
   }
   return ranges;
 }
+const ROLLUP_VERSION = 1;
+
+function rollupVersion(
+  config: Config,
+  sources: readonly SourceRow[],
+  earliestUsageDate: string | null,
+  shallow: boolean,
+): number {
+  const fingerprint = createHash("sha256").update(JSON.stringify([
+    ROLLUP_VERSION,
+    enabledAgents(config),
+    sources.map((source) => [
+      source.agent, source.kind, source.state, source.token_quality, source.work_quality,
+      source.reasons_json, source.last_successful_scan_ms !== null,
+    ]),
+    earliestUsageDate,
+    shallow,
+    PRICING_METADATA,
+  ])).digest("hex");
+  return Number.parseInt(fingerprint.slice(0, 12), 16);
+}
+
+function invalidateRollups(store: CollectorStore): void {
+  const dirty = store.database.query("SELECT date FROM rollup_dirty_utc_days").all() as Array<{ date: string }>;
+  if (dirty.length === 0) return;
+  if (dirty.some((row) => row.date === "*")) {
+    store.database.query("DELETE FROM rollup_days").run();
+  } else {
+    const remove = store.database.query(
+      "DELETE FROM rollup_days WHERE date BETWEEN date(?, '-1 day') AND date(?, '+1 day')",
+    );
+    for (const row of dirty) remove.run(row.date, row.date);
+  }
+  store.database.query("DELETE FROM rollup_dirty_utc_days").run();
+}
+
 /** Read one consistent ledger snapshot and construct only the strict public allowlist. */
 export function buildPublicSnapshot(config: Config, store: CollectorStore, cutoffMs: number): PublicSnapshot {
   if (!Number.isSafeInteger(cutoffMs) || cutoffMs < 0) throw new TypeError("cutoffMs must be a nonnegative safe integer");
-  return store.readTransaction((ledger) => {
+  return store.transaction((ledger) => {
+    invalidateRollups(ledger);
     const cutoffDate = Temporal.Instant.fromEpochMilliseconds(cutoffMs).toZonedDateTimeISO(config.timezone).toPlainDate();
     const periodStartDate = cutoffDate.subtract({ days: 364 });
     const periodStart = periodStartDate.toString();
@@ -1012,20 +1051,20 @@ export function buildPublicSnapshot(config: Config, store: CollectorStore, cutof
       SELECT agent, kind, state, token_quality, work_quality, reasons_json, last_successful_scan_ms
       FROM sources ORDER BY agent, source_key
     `).all() as SourceRow[];
-    const usageRows = ledger.database.query(`
+    const dayUsage = ledger.database.query(`
       SELECT origin_key, agent, session_key, workspace_key, repository_key, turn_key, request_key,
              at_ms, provider, model, uncached_input, cache_read, cache_write, output, reasoning,
              total, cost_microusd, cost_kind, quality, reasons_json
       FROM usage
-      WHERE scope_decision = 'included' AND at_ms IS NOT NULL AND at_ms >= ? AND at_ms <= ?
+      WHERE scope_decision = 'included' AND at_ms >= ? AND at_ms < ?
       ORDER BY at_ms, origin_key
-    `).all(periodStartMs, cutoffMs) as UsageRow[];
-    const workRows = ledger.database.query(`
+    `);
+    const dayWork = ledger.database.query(`
       SELECT origin_key, agent, session_key, workspace_key, repository_key, provider, model, start_ms, end_ms, kind
       FROM work_intervals
       WHERE scope_decision = 'included' AND end_ms > ? AND start_ms < ?
       ORDER BY start_ms, end_ms, origin_key
-    `).all(periodStartMs, cutoffMs) as WorkRow[];
+    `);
     const inputRows = ledger.database.query(`
       SELECT origin_key, source_key, agent, session_key, at_ms, kind, lane, origin, origin_evidence,
              quality, reasons_json, scope_decision
@@ -1038,31 +1077,49 @@ export function buildPublicSnapshot(config: Config, store: CollectorStore, cutof
       FROM input_source_state
       ORDER BY agent, source_key
     `).all() as InputSourceStateRow[];
-    const commitRows = ledger.database.query(`
+    const dayCommits = ledger.database.query(`
       SELECT repository_key, oid, committer_ms, shallow FROM commits
-      WHERE committer_ms >= ? AND committer_ms <= ? ORDER BY committer_ms, repository_key, oid
-    `).all(periodStartMs, cutoffMs) as CommitRow[];
+      WHERE committer_ms >= ? AND committer_ms < ?
+      ORDER BY committer_ms, repository_key, oid
+    `);
+    const anyShallow = ledger.database.query(
+      "SELECT 1 FROM commits WHERE shallow <> 0 AND committer_ms >= ? AND committer_ms <= ? LIMIT 1",
+    ).get(periodStartMs, cutoffMs);
     const latestRun = ledger.database.query(`
       SELECT status, diagnostic_counts_json FROM collection_runs
       WHERE status IN ('completed','partial') AND cutoff_ms <= ?
       ORDER BY completed_at_ms DESC, started_at_ms DESC LIMIT 1
     `).get(cutoffMs) as CollectionRunRow | null;
-    const scopeRows = ledger.database.query(`
+    const dayScope = ledger.database.query(`
       SELECT origin_key, agent, session_key, workspace_key, repository_key, at_ms, provider,
              known_total, decision, reason, last_seen_ms
-      FROM scope_evidence
+      FROM scope_evidence WHERE at_ms >= ? AND at_ms < ?
       UNION ALL
       SELECT usage.origin_key, usage.agent, usage.session_key, usage.workspace_key, usage.repository_key,
              usage.at_ms, usage.provider, usage.total, usage.scope_decision, usage.scope_reason, usage.updated_at_ms
       FROM usage
-      WHERE NOT EXISTS (
-        SELECT 1 FROM scope_evidence WHERE scope_evidence.origin_key = usage.origin_key
-      )
+      WHERE usage.at_ms >= ? AND usage.at_ms < ?
+        AND NOT EXISTS (SELECT 1 FROM scope_evidence WHERE scope_evidence.origin_key = usage.origin_key)
       ORDER BY at_ms, origin_key
+    `);
+    const undatedScopeRows = ledger.database.query(`
+      SELECT origin_key, agent, session_key, workspace_key, repository_key, at_ms, provider,
+             known_total, decision, reason, last_seen_ms
+      FROM scope_evidence WHERE at_ms IS NULL
+      UNION ALL
+      SELECT usage.origin_key, usage.agent, usage.session_key, usage.workspace_key, usage.repository_key,
+             usage.at_ms, usage.provider, usage.total, usage.scope_decision, usage.scope_reason, usage.updated_at_ms
+      FROM usage
+      WHERE usage.at_ms IS NULL
+        AND NOT EXISTS (SELECT 1 FROM scope_evidence WHERE scope_evidence.origin_key = usage.origin_key)
     `).all() as ScopeEvidenceRow[];
-
-    const usage = usageRows.map(publicUsageRecord);
-    const intervals = workRows.map(publicWorkInterval);
+    const legacyScope = ledger.database.query(
+      "SELECT 1 FROM scope_evidence WHERE reason = 'legacy-unreconciled' LIMIT 1",
+    ).get() ?? ledger.database.query(
+      "SELECT 1 FROM usage WHERE scope_reason = 'legacy-unreconciled' AND NOT EXISTS (SELECT 1 FROM scope_evidence WHERE scope_evidence.origin_key = usage.origin_key) LIMIT 1",
+    ).get();
+    const scopeExists = ledger.database.query("SELECT 1 FROM scope_evidence LIMIT 1").get()
+      ?? ledger.database.query("SELECT 1 FROM usage LIMIT 1").get();
     const agents = enabledAgents(config);
     const accountingSources = sourceRows.filter((row) => agents.includes(row.agent as Agent));
     const tokenEvidence = aggregateSourceEvidence(accountingSources, agents, "tokens");
@@ -1074,14 +1131,10 @@ export function buildPublicSnapshot(config: Config, store: CollectorStore, cutof
       workEvidenceByAgent.set(agent, evidenceForSources(accountingSources.filter((row) => row.agent === agent), "work"));
     }
 
-    const earliestUsageDate = usage[0]?.atMs === undefined ? null : dateAt(usage[0].atMs!, config.timezone);
-    const usageByDate = new Map<string, UsageRecord[]>();
-    for (const record of usage) {
-      const date = dateAt(record.atMs!, config.timezone);
-      const records = usageByDate.get(date) ?? [];
-      records.push(record);
-      usageByDate.set(date, records);
-    }
+    const firstUsage = ledger.database.query(
+      "SELECT MIN(at_ms) AS at_ms FROM usage WHERE scope_decision = 'included' AND at_ms >= ? AND at_ms <= ?",
+    ).get(periodStartMs, cutoffMs) as { at_ms: number | null };
+    const earliestUsageDate = firstUsage.at_ms === null ? null : dateAt(firstUsage.at_ms, config.timezone);
     const gitSources = sourceRows.filter((row) => row.kind === "git-repository" || row.agent === "git");
     const gitReasons = fixedReasons(...gitSources.map((row) => parseStringArray(row.reasons_json)));
     const commitEvidence: SourceEvidence = gitSources.length === 0
@@ -1092,58 +1145,58 @@ export function buildPublicSnapshot(config: Config, store: CollectorStore, cutof
           )),
           reasons: gitReasons,
         };
-    const commitsByDate = new Map<string, number>();
-    for (const commit of commitRows) {
-      const date = dateAt(commit.committer_ms, config.timezone);
-      commitsByDate.set(date, (commitsByDate.get(date) ?? 0) + 1);
-    }
-    const scopeRowsByDate = new Map<string, ScopeEvidenceRow[]>();
-    const undatedScopeRows: ScopeEvidenceRow[] = [];
-    for (const row of scopeRows) {
-      if (row.at_ms === null) {
-        undatedScopeRows.push(row);
-        continue;
-      }
-      if (row.at_ms < periodStartMs || row.at_ms > cutoffMs) continue;
-      const date = dateAt(row.at_ms, config.timezone);
-      const rows = scopeRowsByDate.get(date) ?? [];
-      rows.push(row);
-      scopeRowsByDate.set(date, rows);
-    }
-    if (commitRows.some((row) => row.shallow !== 0) && commitEvidence.status === "recorded") commitEvidence.status = "partial";
+    if (anyShallow !== null && commitEvidence.status === "recorded") commitEvidence.status = "partial";
+    const version = rollupVersion(config, sourceRows, earliestUsageDate, anyShallow !== null);
+    const cachedDay = ledger.database.query(
+      "SELECT day_json FROM rollup_days WHERE date = ? AND timezone = ? AND version = ?",
+    );
+    const saveDay = ledger.database.query(`
+      INSERT INTO rollup_days (date, timezone, version, day_json) VALUES (?, ?, ?, ?)
+      ON CONFLICT(date, timezone) DO UPDATE SET version = excluded.version, day_json = excluded.day_json
+    `);
 
     const days: PublicDay[] = [];
-    let nextIntervalIndex = 0;
-    let activeIntervals: WorkInterval[] = [];
     for (let offset = 0; offset < 365; offset += 1) {
       const plainDate = periodStartDate.add({ days: offset });
       const date = plainDate.toString();
+      // The cutoff day is provisional; earlier days are complete and reusable.
+      if (offset < 364) {
+        const stored = cachedDay.get(date, config.timezone, version) as { day_json: string } | null;
+        if (stored !== null) {
+          days.push(JSON.parse(stored.day_json) as PublicDay);
+          continue;
+        }
+      }
+      const startMs = plainDate.toZonedDateTime({
+        timeZone: config.timezone, plainTime: Temporal.PlainTime.from("00:00"),
+      }).epochMilliseconds;
+      const endMs = plainDate.add({ days: 1 }).toZonedDateTime({
+        timeZone: config.timezone, plainTime: Temporal.PlainTime.from("00:00"),
+      }).epochMilliseconds;
+      const queryEnd = Math.min(endMs, cutoffMs + 1);
+      const dayRecords = (dayUsage.all(startMs, queryEnd) as UsageRow[]).map(publicUsageRecord);
+      const dayIntervals = (dayWork.all(startMs, queryEnd) as WorkRow[]).map(publicWorkInterval);
+      const scopeRows = dayScope.all(startMs, queryEnd, startMs, queryEnd) as ScopeEvidenceRow[];
+      const commitsForDay = dayCommits.all(startMs, queryEnd) as CommitRow[];
       const slots = buildHourlySlots(date, config.timezone, cutoffMs);
       const elapsedMs = slots.reduce((sum, slot) => sum + slot.elapsedMs, 0);
-      const dayRecords = usageByDate.get(date) ?? [];
-      const usageKnown = earliestUsageDate !== null && date >= earliestUsageDate;
       const aggregate = aggregateUsageRecords(dayRecords, {
         status: tokenEvidence.status,
         reasons: tokenEvidence.reasons,
-        knownEmpty: usageKnown,
+        knownEmpty: earliestUsageDate !== null && date >= earliestUsageDate,
       });
-      const hours = slots.map((slot) => {
-        while (nextIntervalIndex < intervals.length && intervals[nextIntervalIndex]!.startMs < slot.endMs) {
-          activeIntervals.push(intervals[nextIntervalIndex]!);
-          nextIntervalIndex += 1;
-        }
-        activeIntervals = activeIntervals.filter((interval) => interval.endMs > slot.startMs);
-        return {
-          start: slot.start,
-          elapsedMs: slot.elapsedMs,
-          work: workGroupForSlot(activeIntervals, slot.startMs, slot.endMs, agents, workEvidence, workEvidenceByAgent),
-        };
-      });
-      const commitCount = commitsByDate.get(date) ?? 0;
+      const hours = slots.map((slot) => ({
+        start: slot.start,
+        elapsedMs: slot.elapsedMs,
+        work: workGroupForSlot(
+          dayIntervals.filter((interval) => interval.startMs < slot.endMs && interval.endMs > slot.startMs),
+          slot.startMs, slot.endMs, agents, workEvidence, workEvidenceByAgent,
+        ),
+      }));
       const commits = commitEvidence.status === "unavailable"
         ? metric<number>(null, "unavailable", commitEvidence.reasons)
-        : metric(commitCount, commitEvidence.status, commitEvidence.reasons);
-      days.push({
+        : metric(commitsForDay.length, commitEvidence.status, commitEvidence.reasons);
+      const day: PublicDay = {
         date,
         elapsedMs,
         usage: aggregate.usage,
@@ -1152,8 +1205,10 @@ export function buildPublicSnapshot(config: Config, store: CollectorStore, cutof
         work: combineWorkGroups(hours, agents),
         hours,
         commits,
-        scope: scopeCoverage(scopeRowsByDate.get(date) ?? []),
-      });
+        scope: scopeCoverage(scopeRows),
+      };
+      days.push(day);
+      if (offset < 364) saveDay.run(date, config.timezone, version, JSON.stringify(day));
     }
 
     const counts = latestRun ? parseCounts(latestRun.diagnostic_counts_json) : {};
@@ -1163,11 +1218,18 @@ export function buildPublicSnapshot(config: Config, store: CollectorStore, cutof
       return rows.length === 0 || rows.some((row) => row.state !== "available" || row.token_quality !== "recorded" || row.work_quality !== "recorded");
     }) || gitSources.length === 0 || gitSources.some((row) => row.state !== "available");
     const scopeStatus: Quality =
-      scopeRows.length === 0 || scopeRows.some((row) => row.reason === "legacy-unreconciled")
+      scopeExists === null || legacyScope !== null
         ? "partial"
         : sourceRows.some((row) => row.state !== "available")
           ? "partial"
           : "recorded";
+    const cadenceWorkRows = ledger.database.query(`
+      SELECT origin_key, agent, session_key, workspace_key, repository_key, provider, model, start_ms, end_ms, kind
+      FROM work_intervals
+      WHERE scope_decision = 'included' AND end_ms > ? AND start_ms < ?
+      ORDER BY start_ms, end_ms, origin_key
+    `).all(periodStartMs, cutoffMs) as WorkRow[];
+    const intervals = cadenceWorkRows.map(publicWorkInterval);
     const inputRanges = buildInputRanges(
       inputRows,
       inputStates,

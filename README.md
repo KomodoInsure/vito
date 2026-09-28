@@ -86,6 +86,8 @@ Accounting and measured work are separate. VITO counts an agent as active only w
 
 Collection is idempotent. Semantic origin keys, cumulative-counter baselines, JSONL cursors, and SQLite watermarks prevent unchanged or replayed records from being counted twice.
 
+Exports checkpoint completed daily/hourly public aggregates in the private SQLite ledger. Subsequent exports reuse those days instead of loading a year of raw usage and scope records for the daily charts. Changes to historical usage, intervals, scope evidence, or commits invalidate affected days; an interval crossing midnight invalidates both days. The cutoff day is always computed fresh, and changes to the timezone, enabled sources, pricing, or aggregation version rebuild cached days. Raw facts remain in the ledger; input-cadence ranges still read retained work intervals across the reporting window. Rollups do not change source scanning or JSONL cursor behavior.
+
 ## Commands
 
 ### `init`
@@ -231,7 +233,7 @@ On macOS, installation creates this managed launch agent:
 ~/Library/LaunchAgents/com.komodorisk.vito.plist
 ```
 
-It runs `tick` every 60 seconds and at login, while publication remains limited to once every 15 minutes. Uninstall removes only the managed job and plist; private data and exports remain.
+It runs `tick` every 15 minutes and at login. Uninstall removes only the managed job and plist; private data and exports remain.
 
 VITO does not change coding-agent configurations, install hooks, poll agent processes, or copy the full user environment into launchd.
 

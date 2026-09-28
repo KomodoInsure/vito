@@ -602,8 +602,7 @@ export function createDefaultCommandRunner(
           const options = command.at === undefined
             ? { outDir: command.out }
             : { outDir: command.out, at: command.at };
-          const result = store.readTransaction(() =>
-            operations.exportStaticSite(config, store, options));
+          const result = operations.exportStaticSite(config, store, options);
           writeOut(`Exported activity ${JSON.stringify({
             directory: result.outDir,
             files: result.files,

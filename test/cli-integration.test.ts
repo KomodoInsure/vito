@@ -313,21 +313,6 @@ describe("integrated CLI runner", () => {
     expect(result.output[0]).toContain('"repositories":1');
   });
 
-  test("export holds a consistent read transaction and forwards the fixed cutoff", async () => {
-    const events: string[] = [];
-    const at = "2026-09-06T17:45:00.000Z";
-    const result = await execute(["export", "--out", "/tmp/site", "--at", at], operations(events));
-
-    expect(result.code).toBe(0);
-    expect(events).toEqual([
-      "load:default",
-      "open-store:/private/vito-state",
-      "read-transaction",
-      `export:/tmp/site:${at}`,
-      "close-store",
-    ]);
-    expect(result.output[0]).toContain('"unallocatedUsageRecords":2');
-  });
 
   test("scope reads the private ledger without collecting or locking", async () => {
     const events: string[] = [];

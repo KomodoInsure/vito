@@ -342,6 +342,68 @@ describe("zoned reporting boundaries", () => {
 });
 
 describe("public snapshot", () => {
+  test("recomputes checkpointed days when a corrected fact moves between dates", () => {
+    const store = temporaryStore();
+    try {
+      installCodexSource(store);
+      const cutoff = Date.parse("2026-09-06T12:00:00Z");
+      const fifth = Date.parse("2026-09-05T10:00:00Z");
+      const fourth = Date.parse("2026-09-04T10:00:00Z");
+      store.writeBatch({ usage: [usage("corrected", { atMs: fifth, total: 10, output: 10 })] });
+      const first = buildPublicSnapshot(config(store.stateDir), store, cutoff);
+      expect(first.days.at(-2)?.usage.total.value).toBe(10);
+
+      store.writeBatch({ usage: [usage("corrected", { atMs: fourth, total: 20, output: 20 })] });
+      const corrected = buildPublicSnapshot(config(store.stateDir), store, cutoff);
+      expect(corrected.days.at(-3)?.usage.total.value).toBe(20);
+      expect(corrected.days.at(-2)?.usage.total.value).toBe(0);
+    } finally {
+      store.close();
+    }
+  });
+  test("refreshes both checkpointed dates when a midnight-spanning interval changes", () => {
+    const store = temporaryStore();
+    try {
+      installCodexSource(store);
+      const cutoff = Date.parse("2026-09-07T12:00:00Z");
+      const start = Date.parse("2026-09-05T23:30:00Z");
+      const originalEnd = Date.parse("2026-09-06T00:30:00Z");
+      store.writeBatch({ workIntervals: [interval("changed", "codex", "lane", start, originalEnd)] });
+      const initial = buildPublicSnapshot(config(store.stateDir), store, cutoff);
+      expect(initial.days.at(-3)?.work.work.value?.activeMs).toBe(1_800_000);
+      expect(initial.days.at(-2)?.work.work.value?.activeMs).toBe(1_800_000);
+
+      store.writeBatch({ workIntervals: [interval(
+        "changed", "codex", "lane",
+        Date.parse("2026-09-06T00:15:00Z"), Date.parse("2026-09-06T00:45:00Z"),
+      )] });
+      const corrected = buildPublicSnapshot(config(store.stateDir), store, cutoff);
+      expect(corrected.days.at(-3)?.work.work.value).toBeNull();
+      expect(corrected.days.at(-2)?.work.work.value?.activeMs).toBe(1_800_000);
+      expect(corrected.days.at(-2)?.hours[0]?.work.work.value?.activeMs).toBe(1_800_000);
+    } finally {
+      store.close();
+    }
+  });
+
+
+  test("does not checkpoint a partial cutoff day", () => {
+    const store = temporaryStore();
+    try {
+      installCodexSource(store);
+      store.writeBatch({ usage: [
+        usage("early", { atMs: Date.parse("2026-09-06T08:00:00Z"), total: 10, output: 10 }),
+        usage("late", { atMs: Date.parse("2026-09-06T11:00:00Z"), total: 20, output: 20 }),
+      ] });
+      const early = buildPublicSnapshot(config(store.stateDir), store, Date.parse("2026-09-06T09:00:00Z"));
+      const later = buildPublicSnapshot(config(store.stateDir), store, Date.parse("2026-09-06T12:00:00Z"));
+      expect(early.days.at(-1)?.usage.total.value).toBe(10);
+      expect(later.days.at(-1)?.usage.total.value).toBe(30);
+    } finally {
+      store.close();
+    }
+  });
+
   test("counts commit-active dates while retaining partial repository coverage", () => {
     const store = temporaryStore();
     try {

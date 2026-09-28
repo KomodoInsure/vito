@@ -104,6 +104,8 @@ describe("CollectorStore", () => {
         "input_native_evidence",
         "input_provenance",
         "input_source_state",
+        "rollup_days",
+        "rollup_dirty_utc_days",
         "schema_identity",
         "scope_evidence",
         "sessions",
@@ -113,7 +115,7 @@ describe("CollectorStore", () => {
         "workspace_attributions",
       ]);
       expect(store.database.query("SELECT marker FROM schema_identity").all()).toEqual([
-        { marker: "vito-ledger-v3-final-input-provenance" },
+        { marker: "vito-ledger-v4-rollup-days" },
       ]);
 
       const indexes = new Set((store.database.query(
@@ -133,7 +135,7 @@ describe("CollectorStore", () => {
         "input_provenance_native_idx",
       ]) expect(indexes.has(required)).toBe(true);
 
-      expect((store.database.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3);
+      expect((store.database.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(4);
       expect((store.database.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toBe("wal");
       expect(statSync(store.path).mode & 0o777).toBe(0o600);
       expect(statSync(store.stateDir).mode & 0o777).toBe(0o700);
@@ -236,6 +238,8 @@ describe("CollectorStore", () => {
       DROP TABLE input_events;
       DROP TABLE input_native_evidence;
       DROP TABLE input_source_state;
+      DROP TABLE rollup_days;
+      DROP TABLE rollup_dirty_utc_days;
       DROP TABLE input_provenance;
       PRAGMA user_version = 2;
     `);
@@ -243,30 +247,122 @@ describe("CollectorStore", () => {
 
     const migrated = CollectorStore.open(state);
     try {
-      expect((migrated.database.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3);
+      expect((migrated.database.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(4);
       expect(migrated.getUsage("response:one")?.total).toBe(10);
       expect((migrated.database.query("SELECT count(*) AS count FROM input_events").get() as { count: number }).count).toBe(0);
       expect((migrated.database.query(
         "SELECT count(*) AS count FROM input_native_evidence",
       ).get() as { count: number }).count).toBe(0);
       expect(migrated.database.query("SELECT marker FROM schema_identity").all()).toEqual([
-        { marker: "vito-ledger-v3-final-input-provenance" },
+        { marker: "vito-ledger-v4-rollup-days" },
       ]);
     } finally {
       migrated.close();
     }
   });
 
-  test("rejects an incomplete version-three ledger instead of fabricating native evidence", () => {
+  test("invalidates old and new UTC days for changed facts, not identical rescans", () => {
+    const store = CollectorStore.open(temporaryState());
+    try {
+      const dirty = () => store.database.query(
+        "SELECT date FROM rollup_dirty_utc_days ORDER BY date",
+      ).all();
+      const clear = () => store.database.exec("DELETE FROM rollup_dirty_utc_days");
+      const firstDay = 1_700_000_000_000;
+
+      store.upsertUsage(usage(10), 1);
+      clear();
+      store.upsertUsage(usage(10), 2);
+      expect(dirty()).toEqual([]);
+      store.upsertUsage({ ...usage(20), atMs: firstDay + 86_400_000 }, 3);
+      expect(dirty()).toEqual([{ date: "2023-11-14" }, { date: "2023-11-15" }]);
+      clear();
+      store.database.query("DELETE FROM usage WHERE origin_key = ?").run("response:one");
+      expect(dirty()).toEqual([{ date: "2023-11-15" }]);
+
+      clear();
+      store.upsertWorkInterval({ ...interval(firstDay + 1_000), startMs: firstDay }, 1);
+      expect(dirty()).toEqual([{ date: "2023-11-14" }]);
+      clear();
+      store.upsertWorkInterval({ ...interval(firstDay + 3 * 86_400_000), startMs: firstDay }, 2);
+      expect(dirty()).toEqual([{ date: "*" }, { date: "2023-11-14" }, { date: "2023-11-17" }]);
+
+      clear();
+      store.upsertScopeEvidence({
+        originKey: "scope:one", sourceKey: null, agent: "codex", sessionKey: "session:one",
+        workspaceKey: null, repositoryKey: null, atMs: firstDay, provider: null,
+        knownTotal: null, decision: "included", reason: "configured-root", lastSeenMs: 1,
+      });
+      clear();
+      store.upsertScopeEvidence({
+        originKey: "scope:one", sourceKey: null, agent: "codex", sessionKey: "session:one",
+        workspaceKey: null, repositoryKey: null, atMs: firstDay, provider: null,
+        knownTotal: null, decision: "included", reason: "configured-root", lastSeenMs: 2,
+      });
+      expect(dirty()).toEqual([]);
+      store.database.query("UPDATE scope_evidence SET at_ms = NULL WHERE origin_key = ?").run("scope:one");
+      expect(dirty()).toEqual([{ date: "*" }, { date: "2023-11-14" }]);
+
+      clear();
+      store.upsertCommit({ repositoryKey: "repo", oid: "abc", committerMs: firstDay },
+        { tipOid: "abc", collectedAtMs: 1, shallow: false });
+      clear();
+      store.replaceRepositoryCommits("repo", "def", [
+        { repositoryKey: "repo", oid: "def", committerMs: firstDay + 86_400_000 },
+      ], { collectedAtMs: 2, shallow: false });
+      expect(dirty()).toEqual([{ date: "2023-11-14" }, { date: "2023-11-15" }]);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("migrates a version-three ledger with its historical facts intact", () => {
+    const state = temporaryState();
+    const first = CollectorStore.open(state);
+    first.upsertUsage(usage(10), 1);
+    first.upsertCommit(
+      { repositoryKey: "repo", oid: "abc", committerMs: 1_700_000_000_000 },
+      { tipOid: "abc", collectedAtMs: 1, shallow: false },
+    );
+    first.database.exec(`
+      DROP TABLE rollup_days;
+      DROP TABLE rollup_dirty_utc_days;
+      DROP TABLE schema_identity;
+      CREATE TABLE schema_identity (
+        marker TEXT PRIMARY KEY CHECK (marker = 'vito-ledger-v3-final-input-provenance')
+      ) STRICT, WITHOUT ROWID;
+      INSERT INTO schema_identity VALUES ('vito-ledger-v3-final-input-provenance');
+      PRAGMA user_version = 3;
+    `);
+    first.close();
+
+    const migrated = CollectorStore.open(state);
+    try {
+      expect((migrated.database.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(4);
+      expect(migrated.getUsage("response:one")?.total).toBe(10);
+      expect(migrated.listCommits("repo")).toHaveLength(1);
+      expect(migrated.database.query("SELECT marker FROM schema_identity").all()).toEqual([
+        { marker: "vito-ledger-v4-rollup-days" },
+      ]);
+      migrated.upsertUsage(usage(20), 2);
+      expect(migrated.database.query("SELECT date FROM rollup_dirty_utc_days").all()).toEqual([
+        { date: "2023-11-14" },
+      ]);
+    } finally {
+      migrated.close();
+    }
+  });
+
+  test("rejects an incomplete version-four ledger instead of fabricating native evidence", () => {
     const state = temporaryState();
     const first = CollectorStore.open(state);
     first.database.exec("DROP TABLE input_native_evidence");
     first.close();
 
-    expect(() => CollectorStore.open(state)).toThrow(/schema 3 is incomplete.*rebuild/i);
+    expect(() => CollectorStore.open(state)).toThrow(/schema 4 is incomplete.*rebuild/i);
   });
 
-  test("rejects malformed version-three native evidence instead of accepting an empty baseline", () => {
+  test("rejects malformed version-four native evidence instead of accepting an empty baseline", () => {
     const state = temporaryState();
     const first = CollectorStore.open(state);
     first.database.exec(`
@@ -277,16 +373,16 @@ describe("CollectorStore", () => {
     `);
     first.close();
 
-    expect(() => CollectorStore.open(state)).toThrow(/schema 3 has malformed native input evidence.*rebuild/i);
+    expect(() => CollectorStore.open(state)).toThrow(/schema 4 has malformed native input evidence.*rebuild/i);
   });
 
-  test("rejects an unmarked otherwise-final version-three ledger", () => {
+  test("rejects an unmarked otherwise-final version-four ledger", () => {
     const state = temporaryState();
     const first = CollectorStore.open(state);
     first.database.exec("DELETE FROM schema_identity");
     first.close();
 
-    expect(() => CollectorStore.open(state)).toThrow(/schema 3 is incomplete.*identity marker.*rebuild/i);
+    expect(() => CollectorStore.open(state)).toThrow(/schema 4 is incomplete.*identity marker.*rebuild/i);
   });
 
   test("rolls facts and cursor/counter checkpoints back as one batch", () => {

@@ -16,9 +16,10 @@ import {
   type WorkInterval,
 } from "./contracts";
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const DATABASE_FILENAME = "activity.sqlite";
-const SCHEMA_IDENTITY = "vito-ledger-v3-final-input-provenance";
+const PREVIOUS_SCHEMA_IDENTITY = "vito-ledger-v3-final-input-provenance";
+const SCHEMA_IDENTITY = "vito-ledger-v4-rollup-days";
 
 const schemaSql = `
 CREATE TABLE IF NOT EXISTS schema_identity (
@@ -292,7 +293,78 @@ CREATE INDEX IF NOT EXISTS input_events_session_idx ON input_events(agent, sessi
 CREATE INDEX IF NOT EXISTS input_events_source_idx ON input_events(source_key);
 CREATE INDEX IF NOT EXISTS input_events_native_idx ON input_events(agent, native_session_id, native_input_id);
 CREATE INDEX IF NOT EXISTS input_provenance_native_idx ON input_provenance(agent, native_session_id, native_input_id);
+
+CREATE TABLE IF NOT EXISTS rollup_days (
+  date TEXT NOT NULL,
+  timezone TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  day_json TEXT NOT NULL,
+  PRIMARY KEY (date, timezone)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS rollup_dirty_utc_days (
+  date TEXT PRIMARY KEY
+) STRICT, WITHOUT ROWID;
 `;
+
+// Changes to a fact can affect both its former and its new day. The starred
+// marker means all cached days must be rebuilt (unknown date or long interval).
+const rollupFactTables = [
+  {
+    table: "usage",
+    columns: ["agent", "session_key", "workspace_key", "repository_key", "turn_key", "request_key",
+      "at_ms", "provider", "model", "uncached_input", "cache_read", "cache_write", "output",
+      "reasoning", "total", "cost_microusd", "cost_kind", "quality", "reasons_json",
+      "scope_decision", "scope_reason"],
+    dates: ["at_ms"],
+  },
+  {
+    table: "work_intervals",
+    columns: ["agent", "session_key", "workspace_key", "repository_key", "provider", "model",
+      "start_ms", "end_ms", "kind", "scope_decision", "scope_reason"],
+    dates: ["start_ms", "end_ms"],
+  },
+  {
+    table: "scope_evidence",
+    columns: ["source_key", "agent", "session_key", "workspace_key", "repository_key",
+      "at_ms", "provider", "known_total", "decision", "reason"],
+    dates: ["at_ms"],
+  },
+  {
+    table: "commits",
+    columns: ["repository_key", "oid", "committer_ms"],
+    dates: ["committer_ms"],
+  },
+] as const;
+
+const dirtyDayTriggersSql = rollupFactTables.flatMap(({ table, columns, dates }) => {
+  const markDates = (row: "OLD" | "NEW") => [
+    ...dates.map((column) => `INSERT INTO rollup_dirty_utc_days(date)
+      VALUES (COALESCE(date(${row}.${column} / 1000, 'unixepoch'), '*'))
+      ON CONFLICT(date) DO NOTHING;`),
+    ...(table === "work_intervals"
+      ? [`INSERT INTO rollup_dirty_utc_days(date)
+        SELECT '*' WHERE (${row}.end_ms / 86400000) - (${row}.start_ms / 86400000) > 1
+        ON CONFLICT(date) DO NOTHING;`]
+      : []),
+  ].join("\n");
+  return [
+    `CREATE TRIGGER IF NOT EXISTS ${table}_rollup_insert AFTER INSERT ON ${table} BEGIN
+      ${markDates("NEW")}
+    END;`,
+    `CREATE TRIGGER IF NOT EXISTS ${table}_rollup_update AFTER UPDATE ON ${table}
+      WHEN ${columns.map((column) => `OLD.${column} IS NOT NEW.${column}`).join(" OR ")}
+      BEGIN
+        ${markDates("OLD")}
+        ${markDates("NEW")}
+      END;`,
+    `CREATE TRIGGER IF NOT EXISTS ${table}_rollup_delete AFTER DELETE ON ${table} BEGIN
+      ${markDates("OLD")}
+    END;`,
+  ];
+}).join("\n");
+
+const rollupSchemaSql = `${schemaSql}\n${dirtyDayTriggersSql}`;
 
 const REQUIRED_SCHEMA_TABLES = [
   "collection_runs",
@@ -303,6 +375,8 @@ const REQUIRED_SCHEMA_TABLES = [
   "input_native_evidence",
   "input_provenance",
   "input_source_state",
+  "rollup_days",
+  "rollup_dirty_utc_days",
   "schema_identity",
   "scope_evidence",
   "sessions",
@@ -321,14 +395,16 @@ const INPUT_NATIVE_EVIDENCE_COLUMNS = [
   "origin_evidence",
 ] as const;
 
-function assertSchemaIntegrity(database: Database): void {
+function assertSchemaIntegrity(database: Database, version = SCHEMA_VERSION): void {
   const tables = new Set((database.query(
     "SELECT name FROM sqlite_master WHERE type = 'table'",
   ).all() as Array<{ name: string }>).map((row) => row.name));
-  const missingTables = REQUIRED_SCHEMA_TABLES.filter((table) => !tables.has(table));
+  const missingTables = REQUIRED_SCHEMA_TABLES.filter(
+    (table) => (version >= 4 || !table.startsWith("rollup_")) && !tables.has(table),
+  );
   if (missingTables.length > 0) {
     throw new Error(
-      `Collector database schema ${SCHEMA_VERSION} is incomplete; rebuild required (missing tables: ${missingTables.join(", ")})`,
+      `Collector database schema ${version} is incomplete; rebuild required (missing tables: ${missingTables.join(", ")})`,
     );
   }
 
@@ -340,13 +416,13 @@ function assertSchemaIntegrity(database: Database): void {
     || schemaIdentityColumns.some((column, index) => column !== SCHEMA_IDENTITY_COLUMNS[index])
   ) {
     throw new Error(
-      `Collector database schema ${SCHEMA_VERSION} has malformed schema identity; rebuild required`,
+      `Collector database schema ${version} has malformed schema identity; rebuild required`,
     );
   }
   const schemaIdentities = database.query("SELECT marker FROM schema_identity").all() as Array<{ marker: string }>;
-  if (schemaIdentities.length !== 1 || schemaIdentities[0]?.marker !== SCHEMA_IDENTITY) {
+  if (schemaIdentities.length !== 1 || schemaIdentities[0]?.marker !== (version === 3 ? PREVIOUS_SCHEMA_IDENTITY : SCHEMA_IDENTITY)) {
     throw new Error(
-      `Collector database schema ${SCHEMA_VERSION} is incomplete; final schema identity marker is missing; rebuild required`,
+      `Collector database schema ${version} is incomplete; final schema identity marker is missing; rebuild required`,
     );
   }
 
@@ -358,8 +434,29 @@ function assertSchemaIntegrity(database: Database): void {
     || nativeEvidenceColumns.some((column, index) => column !== INPUT_NATIVE_EVIDENCE_COLUMNS[index])
   ) {
     throw new Error(
-      `Collector database schema ${SCHEMA_VERSION} has malformed native input evidence; rebuild required`,
+      `Collector database schema ${version} has malformed native input evidence; rebuild required`,
     );
+  }
+  if (version >= 4) {
+    for (const [table, expected] of [
+      ["rollup_days", ["date", "timezone", "version", "day_json"]],
+      ["rollup_dirty_utc_days", ["date"]],
+    ] as const) {
+      const columns = (database.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((row) => row.name);
+      if (columns.length !== expected.length || columns.some((column, index) => column !== expected[index])) {
+        throw new Error(`Collector database schema ${version} has malformed ${table}; rebuild required`);
+      }
+    }
+    const triggers = new Set((database.query(
+      "SELECT name FROM sqlite_master WHERE type = 'trigger'",
+    ).all() as Array<{ name: string }>).map((row) => row.name));
+    for (const { table } of rollupFactTables) {
+      for (const operation of ["insert", "update", "delete"]) {
+        if (!triggers.has(`${table}_rollup_${operation}`)) {
+          throw new Error(`Collector database schema ${version} is incomplete; missing ${table} rollup trigger; rebuild required`);
+        }
+      }
+    }
   }
 }
 
@@ -599,7 +696,11 @@ export class CollectorStore {
       } else {
         database.exec("BEGIN IMMEDIATE");
         try {
-          database.exec(schemaSql);
+          if (versionRow.user_version === 3) {
+            assertSchemaIntegrity(database, 3);
+            database.exec("DROP TABLE schema_identity");
+          }
+          database.exec(rollupSchemaSql);
           if (versionRow.user_version === 1) database.exec(migrateVersionOneSql);
           database.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
           database.exec("COMMIT");

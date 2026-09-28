@@ -8,6 +8,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -97,10 +98,18 @@ function fixture(): Fixture {
   };
   writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
   const launchctl = new FixtureLaunchctl();
+  const stableBin = join(root, "stable-bin");
+  mkdirSync(stableBin);
+  const bunPath = join(stableBin, "bun");
+  const gitPath = join(stableBin, "git");
+  const ghPath = join(stableBin, "gh");
+  symlinkSync(process.execPath, bunPath);
+  symlinkSync(executable(join(root, "Cellar", "git", "1.0", "bin", "git")), gitPath);
+  symlinkSync(executable(join(root, "Cellar", "gh", "1.0", "bin", "gh")), ghPath);
   const options: ScheduleOptions = {
-    bunPath: process.execPath,
-    gitPath: executable(join(root, "Git tools & helpers", "git")),
-    ghPath: executable(join(root, "GitHub tools <cli>", "gh")),
+    bunPath,
+    gitPath,
+    ghPath,
     launchctlPath: executable(join(root, "system tools", "launchctl")),
     projectDir,
     plistPath,
@@ -128,7 +137,7 @@ describe("managed launchd plist", () => {
     expect(plist).toContain("config &quot;private&quot; &amp; value.json");
     expect(plist).toContain("private state &amp; logs");
     expect(plist).toContain("<key>Umask</key>\n    <integer>63</integer>");
-    expect(plist).toContain("<key>StartInterval</key>\n    <integer>60</integer>");
+    expect(plist).toContain("<key>StartInterval</key>\n    <integer>900</integer>");
     expect(plist).toContain("<key>RunAtLoad</key>\n    <true/>");
 
     mkdirSync(dirname(value.plistPath), { recursive: true });
@@ -143,7 +152,7 @@ describe("managed launchd plist", () => {
     const parsed = plistJson(value.plistPath);
     const argumentsList = parsed.ProgramArguments as string[];
     expect(argumentsList).toEqual([
-      realpathSync(process.execPath),
+      value.options.bunPath!,
       "run",
       join(realpathSync(value.projectDir), "src", "cli.ts"),
       "--config",
@@ -153,14 +162,10 @@ describe("managed launchd plist", () => {
     expect(parsed.StandardOutPath).toBe(join(value.config.stateDir, "logs", "schedule.stdout.log"));
     expect(parsed.StandardErrorPath).toBe(join(value.config.stateDir, "logs", "schedule.stderr.log"));
     expect(parsed.Umask).toBe(63);
-    expect(parsed.StartInterval).toBe(60);
+    expect(parsed.StartInterval).toBe(900);
     expect(parsed.RunAtLoad).toBe(true);
     expect(parsed.EnvironmentVariables).toEqual({
-      PATH: [
-        dirname(realpathSync(process.execPath)),
-        dirname(realpathSync(value.options.gitPath!)),
-        dirname(realpathSync(value.options.ghPath!)),
-      ].join(":"),
+      PATH: dirname(value.options.bunPath!),
     });
   });
 
@@ -237,6 +242,36 @@ describe("managed launchd plist", () => {
     expect(repeated).toEqual({ label: SCHEDULE_LABEL, plistPath: value.plistPath, removed: false, bootedOut: false });
   });
 
+
+  test("migrates the recognized one-minute plist after package-manager upgrades", async () => {
+    const value = fixture();
+    const current = renderLaunchdPlist(value.config, value.configPath, value.options);
+    const legacyPath = [
+      dirname(realpathSync(value.options.bunPath!)),
+      dirname(realpathSync(value.options.gitPath!)),
+      dirname(realpathSync(value.options.ghPath!)),
+    ].join(":");
+    const legacy = current
+      .replace(`<string>${value.options.bunPath}</string>`, `<string>${realpathSync(value.options.bunPath!)}</string>`)
+      .replace("<integer>900</integer>", "<integer>60</integer>")
+      .replace(`<string>${dirname(value.options.bunPath!)}</string>`, `<string>${legacyPath}</string>`);
+    mkdirSync(dirname(value.plistPath), { recursive: true });
+    writeFileSync(value.plistPath, legacy);
+    value.launchctl.loaded = true;
+
+    const status = await scheduleStatus(value.config, value.configPath, value.options);
+    expect(status).toMatchObject({ installed: true, managed: true, loaded: true });
+    const installed = await installSchedule(value.config, value.configPath, value.options);
+
+    expect(installed.bootstrapped).toBe(true);
+    expect(readFileSync(value.plistPath, "utf8")).toBe(current);
+    expect(value.launchctl.calls.map((call) => call.args[0])).toEqual([
+      "print",
+      "print",
+      "bootout",
+      "bootstrap",
+    ]);
+  });
   test("refuses to replace or remove an unrelated plist without calling launchctl", async () => {
     const value = fixture();
     mkdirSync(dirname(value.plistPath), { recursive: true });
