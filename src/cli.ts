@@ -652,7 +652,7 @@ export function createDefaultCommandRunner(
           const publicationDue =
             lastSuccessMs === null ||
             !Number.isFinite(lastSuccessMs) ||
-            now - lastSuccessMs >= 15 * 60 * 1_000;
+            now - lastSuccessMs >= 60 * 60 * 1_000;
           if (publicationDue) {
             const publication = await operations.publishActivity(config, {
               lockHeld: true,

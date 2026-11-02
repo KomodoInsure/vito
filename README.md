@@ -217,7 +217,7 @@ VITO does not create a repository under a guessed owner or replace unrelated rep
 bun run vito tick
 ```
 
-Runs one collection pass. It exports and publishes only when the last successful publication is at least 15 minutes old. Failed publication never discards a successful local collection.
+Runs one collection pass. It exports and publishes only when the last successful publication is at least one hour old. Failed publication never discards a successful local collection.
 
 ### Scheduling
 
@@ -233,7 +233,7 @@ On macOS, installation creates this managed launch agent:
 ~/Library/LaunchAgents/com.komodorisk.vito.plist
 ```
 
-It runs `tick` every 15 minutes and at login. Uninstall removes only the managed job and plist; private data and exports remain.
+It runs `tick` every 15 minutes and at login. Each tick collects locally; automatic publication happens at most once per hour after a successful publication. Explicit `publish` remains available for immediate updates. Uninstall removes only the managed job and plist; private data and exports remain.
 
 VITO does not change coding-agent configurations, install hooks, poll agent processes, or copy the full user environment into launchd.
 

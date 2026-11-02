@@ -371,12 +371,12 @@ describe("integrated CLI runner", () => {
     ]);
   });
 
-  test("tick below the interval collects activity and Git without publishing", async () => {
+  test.each([15 * 60_000, 30 * 60_000, 60 * 60_000 - 1])("tick at %i ms collects without publishing before the hour", async (elapsed) => {
     const events: string[] = [];
     const result = await execute(["tick"], operations(events, {
       readPublicationState() {
         events.push("read-publication-state");
-        return { lastSuccessfulPublicationAt: new Date(NOW - 14 * 60_000).toISOString() };
+        return { lastSuccessfulPublicationAt: new Date(NOW - elapsed).toISOString() };
       },
     }));
 
@@ -393,12 +393,12 @@ describe("integrated CLI runner", () => {
     expect(result.output[0]).toContain('"publicationDue":false');
   });
 
-  test("tick at the interval delegates one locked collect/export/publication pipeline", async () => {
+  test.each([60 * 60_000, 61 * 60_000])("tick at %i ms delegates one locked publication pipeline", async (elapsed) => {
     const events: string[] = [];
     const result = await execute(["tick"], operations(events, {
       readPublicationState() {
         events.push("read-publication-state");
-        return { lastSuccessfulPublicationAt: new Date(NOW - 15 * 60_000).toISOString() };
+        return { lastSuccessfulPublicationAt: new Date(NOW - elapsed).toISOString() };
       },
     }));
 
